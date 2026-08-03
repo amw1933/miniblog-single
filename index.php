@@ -2094,6 +2094,9 @@ function includePost($post,$cats,$db){?>
     <?php endif;?>
     <div id="tocBox" class="toc-box"></div>
     <div class="content"><?=$post['content_html']??md($post['content'])?></div>
+    <?php if(isAdmin()):?>
+    <div style="text-align:center;margin-top:22px"><button onclick="openEditor(<?= (int)$post['id'] ?>)" class="btn btn-primary" style="padding:8px 24px;font-size:.85rem;"><?=ico('edit',13)?> 编辑此文章</button></div>
+    <?php endif;?>
 
     <!-- 评论区域 -->
     <div class="comments">
@@ -2684,7 +2687,7 @@ header nav .nav-btn.active{background:linear-gradient(135deg,var(--bh),var(--g2)
 .post-card:hover{transform:translateY(-3px);box-shadow:0 10px 30px rgba(0,0,0,.1)}
 .post-card:hover{border-color:rgba(251,108,40,.18)}
 .post-card::before{background:linear-gradient(90deg,var(--g1),var(--g2))}
-.post-thumb{flex:0 0 220px;width:220px;min-height:140px;border-radius:10px;background:linear-gradient(135deg,var(--g1),var(--g2));overflow:hidden;position:relative;display:block;text-decoration:none}
+.post-thumb{flex:0 0 220px;width:220px;min-height:0;aspect-ratio:16/10;height:auto;align-self:flex-start;border-radius:10px;background:linear-gradient(135deg,var(--g1),var(--g2));overflow:hidden;position:relative;display:block;text-decoration:none}
 .post-thumb img{width:100%;height:100%;object-fit:cover;display:block;position:absolute;top:0;left:0}
 .post-thumb svg{width:100%;height:100%;display:block;position:absolute;top:0;left:0}
 .post-thumb time{position:absolute;left:10px;bottom:10px;font-size:.7rem;color:#fff;background:rgba(0,0,0,.55);border-radius:6px;padding:2px 8px;z-index:2}
@@ -2736,7 +2739,7 @@ header nav .nav-btn.active{background:linear-gradient(135deg,var(--bh),var(--g2)
   .header-inner{flex-wrap:wrap;height:auto;padding:12px 14px;gap:8px}
   header nav{margin-left:0}
   .post-card{flex-direction:column;padding:0;border-radius:12px;overflow:hidden;gap:0}
-  .post-thumb{width:100%;flex:none;min-height:180px;height:180px;border-radius:0}
+  .post-thumb{width:100%;flex:none;min-height:0;height:auto;aspect-ratio:16/10;border-radius:0}
   .post-body{padding:18px}
 .single-post h1{font-size:1.45rem}
 }
@@ -2845,6 +2848,10 @@ header nav .nav-btn.active{background:linear-gradient(135deg,var(--bh),var(--g2)
 .blue .author-card .stats{background:rgba(0,0,0,.14)}
 .blue .author-card .stats span{color:rgba(255,255,255,.85)}
 .blue .author-card .stats b{color:#fff}
+/* 正文图片：桌面端收窄居中（宽度 82%，高度不变，不裁切） */
+@media(min-width:768px){
+  .single-post .content img,.editormd-preview-container img{max-width:82%!important;margin-left:auto!important;margin-right:auto!important;display:block!important}
+}
 </style>
   <?php if(isAdmin()):?>
   <link rel="stylesheet" href="editormd/css/editormd.min.css" />
@@ -3297,6 +3304,18 @@ function detectCodeLang(t){
   if(/^-\s+\[/m.test(t)) return 'markdown';
   return '';
 }
+function slugifyTitle(t){
+  return (t||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'')||'post';
+}
+function bindSlugFollow(origTitle,origSlug){
+  var tb=document.getElementById('postTitle');var sb=document.getElementById('postSlug');
+  if(!tb||!sb)return;
+  window._slugManual=false;
+  if(origSlug){sb.value=origSlug;if(origSlug!==slugifyTitle(origTitle))window._slugManual=true;}
+  else{sb.value='';}
+  sb.oninput=function(){window._slugManual=true;};
+  tb.oninput=function(){if(!window._slugManual){sb.value=slugifyTitle(tb.value);}};
+}
 function openEditor(id,fromTrash){
   id=id||0;fromTrash=fromTrash?1:0;
   ensureMermaid();
@@ -3304,7 +3323,7 @@ function openEditor(id,fromTrash){
     var catOpts='<option value="">未分类</option>';
     function addCatOpts(pid,prefix){cats.forEach(function(c){if((c.parent_id||0)==pid){catOpts+='<option value="'+c.id+'">'+prefix+escapeHtml(c.name)+'</option>';addCatOpts(c.id,prefix+'　');}});}
     addCatOpts(0,'');
-  var html='<h2>'+(id?'编辑文章':'写新文章')+'</h2>'+(fromTrash?'<div style="background:#fff7ed;color:#b45309;border:1px solid #fcd34d;border-radius:8px;padding:8px 12px;font-size:.78rem;margin:0 0 10px"><?=ico('alert',14)?> 此文章在回收站中：下方三个按钮里，只有“保存修改/修改后发布”才会保存并自动恢复文章；点“取消”或直接关闭编辑器都不会保存，删除状态保持不变。</div>':'')+'<label>标题</label><input type="text" id="postTitle" placeholder="文章标题"><div class="form-row"><div><label>分类</label><select id="postCat">'+catOpts+'</select></div><div><label>状态</label><select id="postStatus"><option value="1">已发布</option><option value="0">草稿</option></select></div><div><label>发表时间</label><input type="date" id="postTime"></div></div><div class="form-row"><div><label>定时发布 <span class="form-hint">可选</span></label><input type="datetime-local" id="postPublish"></div><div><label>标签 <span class="form-hint">逗号分隔</span></label><input type="text" id="postTags" placeholder="PHP, JavaScript"></div><div><label>访问密码 <span class="form-hint">留空公开</span></label><input type="password" id="postPassword" placeholder="留空公开" autocomplete="new-password"><select id="commonPwSelect" onchange="fillCommonPw(this.value)" style="margin-left:8px;padding:6px 10px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.75rem"></select><button type="button" onclick="saveCommonPw()" style="margin-left:4px;padding:6px 12px;border-radius:40px;border:1px solid #e0e6ed;background:#eef2ff;color:var(--b);font-size:.75rem;cursor:pointer">存为常用</button></div></div><label>Slug <span class="form-hint">可选，留空自动生成</span></label><input type="text" id="postSlug" placeholder="url-friendly-slug"><div id="draftHint" style="font-size:.75rem;color:var(--t3);margin:4px 0;display:none"></div><label>内容 (支持 Markdown)</label><div class="editor-toolbar" style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">'+
+  var html='<h2>'+(id?'编辑文章':'写新文章')+'</h2>'+(fromTrash?'<div style="background:#fff7ed;color:#b45309;border:1px solid #fcd34d;border-radius:8px;padding:8px 12px;font-size:.78rem;margin:0 0 10px"><?=ico('alert',14)?> 此文章在回收站中：下方三个按钮里，只有“保存修改/修改后发布”才会保存并自动恢复文章；点“取消”或直接关闭编辑器都不会保存，删除状态保持不变。</div>':'')+'<label>标题</label><input type="text" id="postTitle" placeholder="文章标题"><div class="form-row"><div><label>分类</label><select id="postCat">'+catOpts+'</select></div><div><label>状态</label><select id="postStatus"><option value="1">已发布</option><option value="0">草稿</option></select></div><div><label>发表时间</label><input type="date" id="postTime"></div></div><div class="form-row"><div><label>定时发布 <span class="form-hint">可选</span></label><input type="datetime-local" id="postPublish"></div><div><label>标签 <span class="form-hint">逗号分隔</span></label><input type="text" id="postTags" placeholder="PHP, JavaScript"></div><div><label>访问密码 <span class="form-hint">留空公开</span></label><input type="password" id="postPassword" placeholder="留空公开" autocomplete="new-password"><select id="commonPwSelect" onchange="fillCommonPw(this.value)" style="margin-left:8px;padding:6px 10px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.75rem"></select><button type="button" onclick="saveCommonPw()" style="margin-left:4px;padding:6px 12px;border-radius:40px;border:1px solid #e0e6ed;background:#eef2ff;color:var(--b);font-size:.75rem;cursor:pointer">存为常用</button></div></div><label>Slug <span class="form-hint">修改标题后自动跟随，可手动修改</span></label><input type="text" id="postSlug" placeholder="修改标题后自动生成"><div id="draftHint" style="font-size:.75rem;color:var(--t3);margin:4px 0;display:none"></div><label>内容 (支持 Markdown)</label><div class="editor-toolbar" style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">'+
       '<button type="button" onclick="editorUpload(\'image\')" class="btn- btn-upload" style="padding:6px 14px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.82rem;cursor:pointer;font-weight:500">📷 上传图片</button>'+
 '<button type="button" onclick="editorUpload(\'file\')" class="btn- btn-upload" style="padding:6px 14px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.82rem;cursor:pointer;font-weight:500"><?=ico('paperclip',13)?> 上传文件</button>'+
 '<button type="button" onclick="insertVideo()" class="btn- btn-upload" style="padding:6px 14px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.82rem;cursor:pointer;font-weight:500"><?=ico('video',13)?> 视频</button><label style="margin-left:8px;font-size:.75rem;color:var(--t3);display:inline-flex;align-items:center;gap:4px">字号<select id="editorFontSize" onchange="applyFontToSelection(this.value)" style="padding:6px 10px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.78rem"><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15" selected>15</option><option value="16">16</option><option value="18">18</option><option value="20">20</option><option value="22">22</option><option value="24">24</option></select></label><label style="margin-left:8px;font-size:.75rem;color:var(--t3);display:inline-flex;align-items:center;gap:4px">颜色<input type="color" id="editorColor" value="#2563eb" onchange="applyColorToSelection(this.value)" oninput="applyColorToSelection(this.value)" style="width:32px;height:26px;padding:0;border:1px solid #e0e6ed;border-radius:8px;background:var(--card);cursor:pointer"></label>'+
@@ -3344,7 +3363,7 @@ function openEditor(id,fromTrash){
       var loadPost=id?apiFetch('?action=admin_get_post&id='+id).then(function(r){return r.json()}).then(function(p){
         if(p.title){
           document.getElementById('postTitle').value=p.title;
-          document.getElementById('postSlug').value=p.slug;
+          bindSlugFollow(p.title,p.slug);
           document.getElementById('postCat').value=p.category_id||'';
           document.getElementById('postStatus').value=p.published;
           document.getElementById('postContent').value=p.content;
@@ -3355,7 +3374,7 @@ function openEditor(id,fromTrash){
           var pwEl=document.getElementById('postPassword');if(pwEl){pwEl.value='';pwEl.placeholder=p.password_set?'当前为私密文章，留空保存将转为公开':'留空公开';}
         }
       }):Promise.resolve();
-      loadPost.then(function(){var np=document.getElementById('postPassword');if(np)np.value='';loadCommonPw();restoreDraft(id);startEditor();});
+      loadPost.then(function(){var np=document.getElementById('postPassword');if(np)np.value='';loadCommonPw();restoreDraft(id);if(!id)bindSlugFollow('','');startEditor();});
     });
   }).catch(function(){alert('加载分类失败，请重试')});
 }
