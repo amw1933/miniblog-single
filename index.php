@@ -322,7 +322,7 @@ function backupFileSet(){
   $map=['index.php'=>__FILE__];
   foreach(glob($root.'/data/*.db')?:[] as $f)$map['data/'.basename($f)]=$f;
   foreach(['data/.htaccess','uploads/.htaccess'] as $rel){$abs=$root.'/'.$rel;if(is_file($abs))$map[$rel]=$abs;}
-  foreach(['editormd','uploads'] as $dir){
+  foreach(['editormd','fonts','uploads'] as $dir){
     $base=$root.'/'.$dir;
     if(!is_dir($base))continue;
     $it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator($base,FilesystemIterator::SKIP_DOTS));
