@@ -1068,6 +1068,36 @@ if($action==='admin_set_theme'&&isAdmin()){
   }
   json(['error'=>'无效主题'],400);
 }
+if($action==='admin_import_urls'&&isAdmin()){
+  csrf_verify();
+  $d=json_decode(file_get_contents('php://input'),true);
+  $urls=array_values(array_unique(array_filter(array_map('trim',(array)($d['urls']??[])))));
+  if(!$urls)json(['error'=>'请提供文章链接'],400);
+  $urls=array_slice($urls,0,10);
+  $results=[];
+  foreach($urls as $url){
+    $res=['url'=>$url,'ok'=>false];
+    if(!preg_match('#^https?://#i',$url)){$res['error']='链接格式不正确';$results[]=$res;continue;}
+    $html=fetchPageHtml($url);
+    if($html===null){$res['error']='抓取失败或页面不可访问';$results[]=$res;continue;}
+    $title=extractPageTitle($html,$url);
+    $title=str_ireplace(' - '.setting($db,'site_name',SITE_NAME),'',$title);
+    $md=htmlToMarkdown(extractMainHtml($html));
+    if(mb_strlen($md)<40&&mb_strlen($title)<3){$res['error']='未能提取到正文内容';$results[]=$res;continue;}
+    $md=downloadRemoteImages($md,$db);
+    $slug=makeUniqueSlug($db,$title);
+    $plain=preg_replace('/[#>*`\[\]!|~-]/u',' ',strip_tags($md));
+    $excerpt=mb_substr(trim(preg_replace('/\s+/u',' ',$plain)),0,200);
+    $md.="\n\n---\n\n🔗 原文链接：[".$url."](".$url.")";
+    $now=date('Y-m-d H:i:s');
+    $db->prepare("INSERT INTO posts(title,slug,content,excerpt,category_id,published,created_at,updated_at,notified)VALUES(?,?,?,?,0,0,?,?,1)")->execute([$title,$slug,$md,$excerpt,$now,$now]);
+    $pid=(int)$db->lastInsertId();
+    addLog($db,'import','导入文章草稿：'.$title);
+    $res['ok']=true;$res['title']=$title;$res['id']=$pid;$res['slug']=$slug;
+    $results[]=$res;
+  }
+  json(['ok'=>true,'results'=>$results]);
+}
 if($action==='admin_settings'&&isAdmin()){
   csrf_verify();
   if($_SERVER['REQUEST_METHOD']==='POST'){
@@ -1600,6 +1630,115 @@ function downloadRemoteImages($content,$db){
     return $m[0];
   },$content);
   return $content;
+}
+function fetchPageHtml($url){
+  $data=null;$http=0;
+  if(function_exists('curl_init')){
+    $ch=curl_init($url);
+    curl_setopt_array($ch,[
+      CURLOPT_RETURNTRANSFER=>1,CURLOPT_FOLLOWLOCATION=>1,CURLOPT_TIMEOUT=>20,
+      CURLOPT_CONNECTTIMEOUT=>8,CURLOPT_SSL_VERIFYPEER=>1,CURLOPT_SSL_VERIFYHOST=>2,
+      CURLOPT_MAXFILESIZE=>3145728,
+      CURLOPT_USERAGENT=>'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      CURLOPT_ENCODING=>''
+    ]);
+    $data=curl_exec($ch);$http=curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);
+  }else{
+    $ctx=stream_context_create(['http'=>['method'=>'GET','timeout'=>20,'follow_location'=>1,'max_redirects'=>5,'header'=>"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n"]]);
+    $data=@file_get_contents($url,false,$ctx);
+    if($data!==false)$http=200;
+  }
+  if(!$data||$http!=200||strlen($data)>3145728||strlen($data)<50)return null;
+  return $data;
+}
+function extractPageTitle($html,$url){
+  if(preg_match('#<title[^>]*>(.*?)</title>#is',$html,$m)){
+    $t=trim(html_entity_decode(strip_tags($m[1]),ENT_QUOTES|ENT_HTML5,'UTF-8'));
+    if($t!=='')return mb_substr($t,0,120);
+  }
+  if(preg_match('#<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']#i',$html,$m))return mb_substr(html_entity_decode($m[1],ENT_QUOTES|ENT_HTML5,'UTF-8'),0,120);
+  $h=parse_url($url,PHP_URL_HOST);
+  return $h?$h:'未命名文章';
+}
+function extractMainHtml($html){
+  $html=preg_replace('#<!--.*?-->#s','',$html);
+  $html=preg_replace('#<(script|style|noscript|iframe|nav|header|footer|aside|form)[^>]*>.*?</\1>#is','',$html);
+  if(preg_match('#<article[^>]*>(.*?)</article>#is',$html,$m))return $m[1];
+  if(preg_match_all('#<(div|main|section)[^>]*(?:class|id)=["\'][^"\']*(?:article|content|post|entry|main)[^"\']*["\'][^>]*>(.*?)</\1>#is',$html,$mm,PREG_SET_ORDER)){
+    $best=null;$bestLen=0;
+    foreach($mm as $cand){
+      $len=strlen(strip_tags($cand[2]));
+      if($len>$bestLen){$bestLen=$len;$best=$cand[2];}
+    }
+    if($best&&$bestLen>80)return $best;
+  }
+  if(preg_match('#<body[^>]*>(.*?)</body>#is',$html,$m))return $m[1];
+  return $html;
+}
+function htmlToMarkdown($html){
+  $html=preg_replace('#<(script|style|noscript)[^>]*>.*?</\1>#is','',$html);
+  $html=preg_replace_callback('#<table[^>]*>(.*?)</table>#is',function($m){
+    $rows=[];
+    if(preg_match_all('#<tr[^>]*>(.*?)</tr>#is',$m[1],$rm)){
+      foreach($rm[1] as $r){
+        $cells=[];
+        if(preg_match_all('#<t[hd][^>]*>(.*?)</t[hd]>#is',$r,$cm)){
+          foreach($cm[1] as $c){
+            $c=preg_replace('/<br\s*\/?>/i',"\n",$c);
+            $c=preg_replace('#<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>#is','[$2]($1)',$c);
+            $c=trim(preg_replace('/\s+/u',' ',strip_tags(html_entity_decode($c,ENT_QUOTES|ENT_HTML5,'UTF-8'))));
+            $c=str_replace('|','\|',$c);
+            $cells[]=$c;
+          }
+        }
+        if($cells)$rows[]=$cells;
+      }
+    }
+    if(!$rows)return '';
+    $cols=max(array_map('count',$rows));
+    $lines=['| '.implode(' | ',array_pad($rows[0],$cols,'')).' |','| '.implode(' | ',array_fill(0,$cols,'---')).' |'];
+    foreach(array_slice($rows,1) as $r)$lines[]='| '.implode(' | ',array_pad($r,$cols,'')).' |';
+    return "\n\n".implode("\n",$lines)."\n\n";
+  },$html);
+  $html=preg_replace('#</(p|div|h[1-6]|li|tr|blockquote|pre|table|ul|ol)>#i',"\n",$html);
+  $html=preg_replace('#<h1[^>]*>#i',"\n# ",$html);
+  $html=preg_replace('#<h2[^>]*>#i',"\n## ",$html);
+  $html=preg_replace('#<h3[^>]*>#i',"\n### ",$html);
+  $html=preg_replace('#<h4[^>]*>#i',"\n#### ",$html);
+  $html=preg_replace('#<h5[^>]*>#i',"\n##### ",$html);
+  $html=preg_replace('#<h6[^>]*>#i',"\n###### ",$html);
+  $html=preg_replace('#<li[^>]*>#i',"\n- ",$html);
+  $html=preg_replace('#<blockquote[^>]*>#i',"\n> ",$html);
+  $html=preg_replace('#<(ul|ol)[^>]*>#i',"\n",$html);
+  $html=preg_replace('#<pre[^>]*><code[^>]*>#i',"\n```\n",$html);
+  $html=preg_replace('#</code></pre>#i',"\n```\n",$html);
+  $html=preg_replace('#<code[^>]*>#i','`',$html);
+  $html=preg_replace('#</code>#i','`',$html);
+  $html=preg_replace('#<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>#is','[$2]($1)',$html);
+  $html=preg_replace('#<img[^>]+src=["\']([^"\']+)["\'][^>]*>#i','![图片]($1)',$html);
+  $html=preg_replace('#<(strong|b)[^>]*>#i','**',$html);
+  $html=preg_replace('#</(strong|b)>#i','**',$html);
+  $html=preg_replace('#<(em|i)[^>]*>#i','*',$html);
+  $html=preg_replace('#</(em|i)>#i','*',$html);
+  $html=preg_replace('#<br\s*/?>#i',"\n",$html);
+  $html=preg_replace('#<(td|th)[^>]*>#i',' | ',$html);
+  $html=preg_replace('#</(td|th)>#i','',$html);
+  $html=preg_replace('#</tr>#i',"\n",$html);
+  $html=preg_replace('#<table[^>]*>#i',"\n",$html);
+  $html=strip_tags($html);
+  $html=html_entity_decode($html,ENT_QUOTES|ENT_HTML5,'UTF-8');
+  $html=preg_replace('/[ \t]+/',' ',$html);
+  $html=preg_replace('/[ \t]*\n[ \t]*/u',"\n",$html);
+  $html=preg_replace('/\n{3,}/',"\n\n",$html);
+  return trim($html);
+}
+function makeUniqueSlug($db,$title){
+  $slug=preg_replace('/[^a-z0-9]+/','-',mb_strtolower(trim($title),'UTF-8'));$slug=trim($slug,'-');
+  if($slug==='')$slug='post';
+  if(mb_strlen($slug)>80)$slug=mb_substr($slug,0,80);
+  $q=$db->prepare("SELECT COUNT(*) FROM posts WHERE slug=?");$q->execute([$slug]);$base=$slug;$i=2;
+  while((int)$q->fetchColumn()>0){$slug=$base.'-'.$i;$i++;$q->execute([$slug]);}
+  return $slug;
 }
 
 try{$sn=setting($db,'site_name',SITE_NAME);}catch(Exception $e){$sn=SITE_NAME;}
@@ -3460,7 +3599,8 @@ function loadSettings(){
     var c1c='<div class="settings-card"><h2><?=ico('clipboard',15)?>操作日志</h2><button onclick="loadLogs()" class="btn btn-secondary">查看最近操作</button><div id="logsBox" style="margin-top:10px"></div></div>';
     var c2='<div class="settings-card"><h2><?=ico('bell',15)?>通知与评论过滤</h2><label>通知邮箱</label><input type="email" id="sNotifyEmail" value="'+escapeHtml(d.notify_email||'')+'" placeholder="留空不启用"><label>Server酱 Webhook</label><input type="url" id="sWebhook" value="'+escapeHtml(d.notify_webhook||'')+'" placeholder="https://sctapi.ftqq.com/KEY.send"><label>Telegram Bot Token</label><input type="text" id="sTgBot" value="'+escapeHtml(d.telegram_bot||'')+'" placeholder="123456789:AAF..."><label>Telegram Chat ID</label><input type="text" id="sTgChat" value="'+escapeHtml(d.telegram_chat||'')+'" placeholder="聊天或群组 ID"><label>评论敏感词（逗号分隔）</label><textarea id="sKeywords" style="min-height:80px">'+escapeHtml(d.comment_keywords||'')+'</textarea></div>';
     var c3='<div class="settings-card"><h2><?=ico('archive',15)?>备份与恢复</h2><label>服务器备份目录</label><input type="text" id="sBackupDir" value="'+escapeHtml(d.backup_dir||'')+'" placeholder="绝对路径或相对路径，留空默认 data/backup"><div class="hint">当前备份目录：'+escapeHtml(d.backup_path||'')+'</div>'+(d.backup_dir_ok===false?'<div style="color:#ef4444;font-size:.78rem;margin-top:6px"><?=ico('alert',12)?> '+escapeHtml(d.backup_dir_err||'备份目录不可用')+'</div>':'')+'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button onclick="saveBackupDir()" class="btn btn-primary"><?=ico('save',15)?> 保存目录</button><button onclick="testBackupDir()" class="btn btn-secondary"><?=ico('flask',15)?> 测试目录</button></div><div id="backupTestBox" style="font-size:.75rem;color:var(--t3);white-space:pre-wrap;display:none;margin-top:8px"></div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button onclick="downloadBackup()" class="btn btn-primary"><?=ico('download',15)?> 下载备份</button><button onclick="serverBackup()" class="btn btn-secondary"><?=ico('save',15)?> 立即备份到服务器</button></div><div class="quota-bar" id="backupBar" style="display:none"><div style="width:0%"></div></div><div id="backupPct" style="font-size:.75rem;color:var(--t3);margin-top:4px"></div><div id="backupServerMsg" style="font-size:.75rem;color:var(--t3);margin-top:6px"></div><div id="backupStatusBanner" style="display:none;background:#fff7ed;color:#b45309;border:1px solid #fcd34d;border-radius:8px;padding:8px 12px;font-size:.78rem;margin:8px 0"></div><div id="backupListBox" style="margin-top:10px"></div><label>恢复备份（点“下载备份”得到的 .zip 完整包，或 .db 数据库；服务器快照直接用列表里的“恢复”按钮）</label><input type="file" id="restoreFile" accept=".zip,.db,.sqlite"><div class="quota-bar" id="restoreBar" style="display:none"><div style="width:0%"></div></div><div id="restorePct" style="font-size:.75rem;color:var(--t3);margin-top:4px"></div><button onclick="restoreBackup()" class="btn btn-secondary" style="margin-top:8px">恢复数据</button></div>';
-    app.innerHTML='<div class="settings-grid"><div class="settings-col">'+c1+c1b+c2+'</div><div class="settings-col" id="settingsCol2">'+c1d+c3+c1c+'</div></div>';
+    var c1e='<div class="settings-card"><h2><?=ico('file-text',15)?>文章链接导入</h2><label>粘贴其它网站的文章链接（每行一个，最多 10 个）</label><textarea id="sImportUrls" rows="4" placeholder="https://example.com/article/1&#10;https://example.com/article/2" style="width:100%;padding:10px 12px;border:1px solid #e0e6ed;border-radius:10px;background:var(--card);color:var(--t1);font-size:.85rem;box-sizing:border-box;resize:vertical"></textarea><div style="display:flex;gap:8px;align-items:center;margin-top:10px"><button onclick="importUrls()" class="btn btn-primary"><?=ico('download',14)?> 抓取并生成草稿</button></div><div id="sImportResult" style="margin-top:10px;font-size:.78rem;line-height:1.8;word-break:break-all"></div><div class="hint">抓取结果自动保存为草稿，可在「文章」中编辑后发布</div></div>';
+    app.innerHTML='<div class="settings-grid"><div class="settings-col">'+c1+c1b+c2+'</div><div class="settings-col" id="settingsCol2">'+c1d+c3+c1e+c1c+'</div></div>';
     injectAuthorSettings(d);
     fixUploadLimitInput();
     loadBackupList();
@@ -3717,6 +3857,25 @@ function removeTagGlobal(){
   if(!tag)return alert('请输入要移除的标签名');
   if(!confirm('确定从所有文章中移除标签 '+tag+' 吗？'))return;
   apiFetch('?action=admin_remove_tag_global',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tag:tag})}).then(function(r){return r.json()}).then(function(d){if(d.ok){alert('✅ 已移除标签 '+tag+(d.removed?'（'+d.removed+' 篇受影响）':'（没有文章使用）'));var e=document.getElementById('sRemoveTag');if(e)e.value='';}else alert(d.error||'操作失败')}).catch(function(){alert('请求失败，请重试')});
+}
+function importUrls(){
+  var ta=document.getElementById('sImportUrls');if(!ta)return;
+  var urls=ta.value.split(/\r?\n/).map(function(s){return s.trim()}).filter(function(s){return s!==''});
+  if(!urls.length)return alert('请先粘贴文章链接');
+  if(urls.length>10)return alert('一次最多导入 10 个链接');
+  var box=document.getElementById('sImportResult');
+  if(box)box.innerHTML='<span style="color:var(--t3)">正在抓取 '+urls.length+' 个链接，请稍候...</span>';
+  apiFetch('?action=admin_import_urls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({urls:urls})}).then(function(r){return r.json()}).then(function(d){
+    if(!box)return;
+    if(!d.ok){box.innerHTML='<span style="color:#ef4444">'+(d.error||'导入失败')+'</span>';return;}
+    var html='';
+    (d.results||[]).forEach(function(r){
+      if(r.ok)html+='<div style="color:#16a34a">✅ '+escapeHtml(r.title)+' <span style="color:var(--t3)">→ 草稿 #'+r.id+'</span></div>';
+      else html+='<div style="color:#ef4444">❌ '+escapeHtml(r.url)+' — '+(r.error||'失败')+'</div>';
+    });
+    box.innerHTML=html;
+    ta.value='';
+  }).catch(function(){if(box)box.innerHTML='<span style="color:#ef4444">请求失败，请重试</span>'});
 }
 function saveSettings(){
   var name=document.getElementById('sSiteName')?.value.trim();if(!name)return alert('站点名称不能为空');
