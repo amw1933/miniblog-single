@@ -1047,7 +1047,7 @@ if($action==='process_paste'&&isAdmin()){
   $markdown=preg_replace('/<p[^>]*>(.*?)<\/p>/is',"$1\n\n",$markdown);
   $markdown=preg_replace('/<div[^>]*>(.*?)<\/div>/is',"$1\n",$markdown);
   $markdown=preg_replace('/<span[^>]*>(.*?)<\/span>/is','$1',$markdown);
-  $markdown=preg_replace('/<table[^>]*>.*?<\/table>/is',"\n*[表格已转换，请编辑时调整格式]*\n",$markdown);
+  $markdown=htmlTableToMarkdown($markdown);
   $markdown=html_entity_decode($markdown,ENT_QUOTES|ENT_HTML5);
   $markdown=strip_tags($markdown);
   $markdown=preg_replace('/\n{4,}/',"\n\n",trim($markdown));
@@ -1677,29 +1677,7 @@ function extractMainHtml($html){
 }
 function htmlToMarkdown($html){
   $html=preg_replace('#<(script|style|noscript)[^>]*>.*?</\1>#is','',$html);
-  $html=preg_replace_callback('#<table[^>]*>(.*?)</table>#is',function($m){
-    $rows=[];
-    if(preg_match_all('#<tr[^>]*>(.*?)</tr>#is',$m[1],$rm)){
-      foreach($rm[1] as $r){
-        $cells=[];
-        if(preg_match_all('#<t[hd][^>]*>(.*?)</t[hd]>#is',$r,$cm)){
-          foreach($cm[1] as $c){
-            $c=preg_replace('/<br\s*\/?>/i',"\n",$c);
-            $c=preg_replace('#<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>#is','[$2]($1)',$c);
-            $c=trim(preg_replace('/\s+/u',' ',strip_tags(html_entity_decode($c,ENT_QUOTES|ENT_HTML5,'UTF-8'))));
-            $c=str_replace('|','\|',$c);
-            $cells[]=$c;
-          }
-        }
-        if($cells)$rows[]=$cells;
-      }
-    }
-    if(!$rows)return '';
-    $cols=max(array_map('count',$rows));
-    $lines=['| '.implode(' | ',array_pad($rows[0],$cols,'')).' |','| '.implode(' | ',array_fill(0,$cols,'---')).' |'];
-    foreach(array_slice($rows,1) as $r)$lines[]='| '.implode(' | ',array_pad($r,$cols,'')).' |';
-    return "\n\n".implode("\n",$lines)."\n\n";
-  },$html);
+  $html=htmlTableToMarkdown($html);
   $html=preg_replace('#</(p|div|h[1-6]|li|tr|blockquote|pre|table|ul|ol)>#i',"\n",$html);
   $html=preg_replace('#<h1[^>]*>#i',"\n# ",$html);
   $html=preg_replace('#<h2[^>]*>#i',"\n## ",$html);
@@ -1731,6 +1709,31 @@ function htmlToMarkdown($html){
   $html=preg_replace('/[ \t]*\n[ \t]*/u',"\n",$html);
   $html=preg_replace('/\n{3,}/',"\n\n",$html);
   return trim($html);
+}
+function htmlTableToMarkdown($html){
+  return preg_replace_callback('#<table[^>]*>(.*?)</table>#is',function($m){
+    $rows=[];
+    if(preg_match_all('#<tr[^>]*>(.*?)</tr>#is',$m[1],$rm)){
+      foreach($rm[1] as $r){
+        $cells=[];
+        if(preg_match_all('#<t[hd][^>]*>(.*?)</t[hd]>#is',$r,$cm)){
+          foreach($cm[1] as $c){
+            $c=preg_replace('/<br\s*\/?>/i',"\n",$c);
+            $c=preg_replace('#<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>#is','[$2]($1)',$c);
+            $c=trim(preg_replace('/\s+/u',' ',strip_tags(html_entity_decode($c,ENT_QUOTES|ENT_HTML5,'UTF-8'))));
+            $c=str_replace('|','\|',$c);
+            $cells[]=$c;
+          }
+        }
+        if($cells)$rows[]=$cells;
+      }
+    }
+    if(!$rows)return '';
+    $cols=max(array_map('count',$rows));
+    $lines=['| '.implode(' | ',array_pad($rows[0],$cols,'')).' |','| '.implode(' | ',array_fill(0,$cols,'---')).' |'];
+    foreach(array_slice($rows,1) as $r)$lines[]='| '.implode(' | ',array_pad($r,$cols,'')).' |';
+    return "\n\n".implode("\n",$lines)."\n\n";
+  },$html);
 }
 function makeUniqueSlug($db,$title){
   $slug=preg_replace('/[^a-z0-9]+/','-',mb_strtolower(trim($title),'UTF-8'));$slug=trim($slug,'-');
