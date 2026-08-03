@@ -104,10 +104,29 @@ MiniBlog 是一个把「博客前台 + 管理后台 + 编辑器 + 数据库 + �
 
 ## 📸 截图
 
-> 将截图放入 `screenshots/` 目录后替换以下引用。
+> 以下截图基于单文件版 v1.0 实际运行效果。
 
-![首页](screenshots/home.png)
-![后台](screenshots/admin.png)
+### 前台
+
+<img src="screenshots/home.png" alt="首页" width="780">
+
+<img src="screenshots/post.png" alt="文章页" width="780">
+
+<img src="screenshots/archive.png" alt="归档页" width="780">
+
+<img src="screenshots/login.png" alt="登录页" width="780">
+
+<img src="screenshots/mobile.png" alt="手机版首页" width="360">
+
+### 后台
+
+<img src="screenshots/admin.png" alt="文章管理" width="780">
+
+<img src="screenshots/admin-settings.png" alt="系统设置" width="780">
+
+<img src="screenshots/admin-files.png" alt="文件管理" width="780">
+
+<img src="screenshots/admin-stats.png" alt="统计" width="780">
 
 ---
 
