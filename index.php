@@ -1107,7 +1107,7 @@ if($action==='admin_settings'&&isAdmin()){
       $backupOk=false;$backupErr='目录存在但 PHP 没有写权限';
     }
   }
-  json(['site_name'=>$sn,'site_desc'=>$sd,'site_copyright'=>$sc,'site_font'=>setting($db,'site_font','web'),'author_name'=>setting($db,'author_name'),'author_bio'=>setting($db,'author_bio'),'author_avatar'=>setting($db,'author_avatar'),'notify_email'=>$ne,'notify_webhook'=>$nw,'comment_keywords'=>$ck,'telegram_bot'=>$tb,'telegram_chat'=>$tc,'backup_dir'=>$bd,'upload_max_mb'=>$upMb,'upload_exts'=>$upExts,'backup_path'=>backupRoot(),'backup_dir_ok'=>$backupOk,'backup_dir_err'=>$backupErr]);
+  json(['site_name'=>$sn,'site_desc'=>$sd,'site_copyright'=>$sc,'site_font'=>setting($db,'site_font','great'),'author_name'=>setting($db,'author_name'),'author_bio'=>setting($db,'author_bio'),'author_avatar'=>setting($db,'author_avatar'),'notify_email'=>$ne,'notify_webhook'=>$nw,'comment_keywords'=>$ck,'telegram_bot'=>$tb,'telegram_chat'=>$tc,'backup_dir'=>$bd,'upload_max_mb'=>$upMb,'upload_exts'=>$upExts,'backup_path'=>backupRoot(),'backup_dir_ok'=>$backupOk,'backup_dir_err'=>$backupErr]);
 }
 if($action==='admin_stats'&&isAdmin()){
   csrf_verify();
@@ -1434,8 +1434,8 @@ function siteFontStacks(){
 }
 function siteFontCss($db){
   $stacks=siteFontStacks();
-  $key=trim(setting($db,'site_font','web'));
-  return $stacks[$key]??$stacks['web'];
+  $key=trim(setting($db,'site_font','great'));
+  return $stacks[$key]??$stacks['great'];
 }
 function gearIcon($size=16,$color='currentColor'){
   return '<svg width="'.$size.'" height="'.$size.'" viewBox="0 0 24 24" fill="none" stroke="'.$color.'" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px;margin-right:4px" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
@@ -1508,7 +1508,10 @@ function getPostThumbnail($content,$title){
     ['#00c6fb','#005bea'],['#b92b27','#1565c0'],['#1e3c72','#2a5298'],
     ['#e65c00','#f9d423'],['#2193b0','#6dd5ed'],['#cc2b5e','#753a88'],
   ];
-  $pal=$palettes[$hash%count($palettes)];
+  static $palOrder=null,$palPos=0;
+  if($palOrder===null){$palOrder=array_keys($palettes);shuffle($palOrder);}
+  $pal=$palettes[$palOrder[$palPos%count($palOrder)]];$palPos++;
+  $gid='g'.bin2hex(random_bytes(5));
   $siteName=setting($db,'site_name',SITE_NAME);
   $siteName=htmlspecialchars($siteName,ENT_QUOTES|ENT_XML1,'UTF-8');
   $svgFont=str_replace("'",'&apos;',siteFontCss($db));
@@ -1526,11 +1529,11 @@ function getPostThumbnail($content,$title){
   $cx2=220+($hash%150);$cy2=80+($hash%100);$r2=30+($hash%50);
   $cx3=($hash%300);$cy3=140+($hash%60);$r3=20+($hash%40);
   $svg='<svg xmlns="http://www.w3.org/2000/svg" width="400" height="240" viewBox="0 0 400 240" preserveAspectRatio="xMidYMid slice">
-    <defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+    <defs><linearGradient id="'.$gid.'" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" style="stop-color:'.$pal[0].'"/>
       <stop offset="100%" style="stop-color:'.$pal[1].'"/>
     </linearGradient></defs>
-    <rect width="400" height="240" fill="url(#g)"/>
+    <rect width="400" height="240" fill="url(#'.$gid.')"/>
     <circle cx="'.$cx1.'" cy="'.$cy1.'" r="'.$r1.'" fill="rgba(255,255,255,0.12)"/>
     <circle cx="'.$cx2.'" cy="'.$cy2.'" r="'.$r2.'" fill="rgba(255,255,255,0.08)"/>
     <circle cx="'.$cx3.'" cy="'.$cy3.'" r="'.$r3.'" fill="rgba(255,255,255,0.06)"/>
@@ -3689,7 +3692,7 @@ function saveSiteSettings(){
   var name=document.getElementById('sSiteName')?.value.trim();if(!name)return alert('站点名称不能为空');
   var desc=document.getElementById('sSiteDesc')?.value.trim()||'';
   var copyright=document.getElementById('sCopyright')?.value.trim()||'';
-  var font=document.getElementById('sSiteFont')?.value||'web';
+  var font=document.getElementById('sSiteFont')?.value||'great';
   apiFetch('?action=admin_settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({site_name:name,site_desc:desc,site_copyright:copyright,site_font:font})}).then(function(r){return r.json()}).then(function(d){if(d.ok){alert('✅ 站点设置已保存');location.reload();}else alert(d.error||'保存失败')}).catch(function(){alert('保存失败，请重试')});
 }
 function fixUploadLimitInput(){
