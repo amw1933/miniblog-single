@@ -103,7 +103,10 @@ try{
   $db->exec('CREATE TABLE IF NOT EXISTS comment_quota(ip TEXT PRIMARY KEY,cnt INTEGER DEFAULT 0,window INTEGER DEFAULT 0)');
   $db->exec('CREATE TABLE IF NOT EXISTS login_attempts(ip TEXT PRIMARY KEY,cnt INTEGER DEFAULT 0,window INTEGER DEFAULT 0)');
   $db->exec('CREATE TABLE IF NOT EXISTS tags(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,slug TEXT UNIQUE NOT NULL)');
-  $db->exec('CREATE TABLE IF NOT EXISTS post_tags(post_id INTEGER NOT NULL,tag_id INTEGER NOT NULL,PRIMARY KEY(post_id,tag_id))');
+$db->exec('CREATE TABLE IF NOT EXISTS post_tags(post_id INTEGER NOT NULL,tag_id INTEGER NOT NULL,PRIMARY KEY(post_id,tag_id))');
+$db->exec('CREATE TABLE IF NOT EXISTS post_categories(post_id INTEGER NOT NULL,category_id INTEGER NOT NULL,PRIMARY KEY(post_id,category_id))');
+$db->exec('CREATE INDEX IF NOT EXISTS idx_post_categories_cat ON post_categories(category_id)');
+try{$db->exec('INSERT OR IGNORE INTO post_categories(post_id,category_id) SELECT id,category_id FROM posts WHERE category_id>0');}catch(Exception $e){}
   $db->exec('CREATE TABLE IF NOT EXISTS stats_daily(date TEXT PRIMARY KEY,pv INTEGER DEFAULT 0,uv INTEGER DEFAULT 0,posts INTEGER DEFAULT 0)');
   $db->exec('CREATE TABLE IF NOT EXISTS admin_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,action TEXT NOT NULL,detail TEXT,ip TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP)');
   $db->exec('CREATE TABLE IF NOT EXISTS comment_blacklist(ip TEXT PRIMARY KEY,note TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP)');
@@ -186,6 +189,10 @@ function loadPostTags($db,$ids){
   $map=[];
   foreach($stmt->fetchAll(PDO::FETCH_ASSOC) as $r)$map[$r['post_id']][]=['id'=>$r['id'],'name'=>$r['name'],'slug'=>$r['slug']];
   return $map;
+}
+function loadPostCats($db,$id){
+  $q=$db->prepare("SELECT c.id,c.name FROM post_categories pc JOIN categories c ON c.id=pc.category_id WHERE pc.post_id=? ORDER BY c.name");
+  $q->execute([$id]);return $q->fetchAll(PDO::FETCH_ASSOC);
 }
 
 function savePostTags($db,$postId,$tagsStr){
@@ -536,7 +543,7 @@ if($action==='posts'){ try{
     $subQ=$db->prepare("SELECT id FROM categories WHERE parent_id=?");$subQ->execute([$cat]);
     foreach($subQ->fetchAll(PDO::FETCH_COLUMN) as $sid)$catIds[]=$sid;
     $placeholders=implode(',',array_fill(0,count($catIds),'?'));
-    $where.=" AND p.category_id IN ($placeholders)";$params=array_merge($params,$catIds);
+    $where.=" AND (p.category_id IN ($placeholders) OR p.id IN (SELECT pc.post_id FROM post_categories pc WHERE pc.category_id IN ($placeholders)))";$params=array_merge($params,$catIds,$catIds);
   }
   if($search){
     try{$db->prepare("INSERT INTO search_log(keyword,hits,last_at)VALUES(?,1,?) ON CONFLICT(keyword) DO UPDATE SET hits=hits+1,last_at=?")->execute([$search,$now,$now]);}catch(Exception $e){}
@@ -582,12 +589,18 @@ if($action==='post'){
   $cs=$db->prepare("SELECT * FROM comments WHERE post_id=? AND approved=1 ORDER BY created_at ASC");$cs->execute([$post['id']]);
   $post['comments']=$cs->fetchAll(PDO::FETCH_ASSOC);
   $tagsMap=loadPostTags($db,[$post['id']]);$post['tags']=$tagsMap[$post['id']]??[];
+  $post['cats']=array_map(function($x){return $x['name'];},loadPostCats($db,$post['id']));
   $related=[];
   $stmt=$db->prepare("SELECT DISTINCT p.id,p.slug,p.title,p.excerpt,p.created_at,p.views FROM posts p JOIN post_tags pt ON pt.post_id=p.id WHERE p.id<>? AND p.published=1 AND (p.publish_at IS NULL OR p.publish_at<=?) AND pt.tag_id IN (SELECT tag_id FROM post_tags WHERE post_id=?) ORDER BY p.views DESC LIMIT 5");
   $stmt->execute([$post['id'],$now,$post['id']]);$related=$stmt->fetchAll(PDO::FETCH_ASSOC);
-  if(!$related&&$post['category_id']){
-    $stmt=$db->prepare("SELECT p.id,p.slug,p.title,p.excerpt,p.created_at,p.views FROM posts p WHERE p.id<>? AND p.category_id=? AND p.published=1 AND (p.publish_at IS NULL OR p.publish_at<=?) ORDER BY p.views DESC LIMIT 5");
-    $stmt->execute([$post['id'],$post['category_id'],$now]);$related=$stmt->fetchAll(PDO::FETCH_ASSOC);
+  if(!$related){
+    $catQ=$db->prepare("SELECT category_id FROM post_categories WHERE post_id=?");$catQ->execute([$post['id']]);$relCats=$catQ->fetchAll(PDO::FETCH_COLUMN);
+    if($post['category_id']&&!in_array($post['category_id'],$relCats,true))$relCats[]=$post['category_id'];
+    if($relCats){
+      $ph=implode(',',array_fill(0,count($relCats),'?'));
+      $stmt=$db->prepare("SELECT DISTINCT p.id,p.slug,p.title,p.excerpt,p.created_at,p.views FROM posts p WHERE p.id<>? AND (p.category_id IN ($ph) OR p.id IN (SELECT pc.post_id FROM post_categories pc WHERE pc.category_id IN ($ph))) AND p.published=1 AND (p.publish_at IS NULL OR p.publish_at<=?) ORDER BY p.views DESC LIMIT 5");
+      $stmt->execute(array_merge([$post['id']],$relCats,$relCats,[$now]));$related=$stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
   }
   $post['related']=$related;
   $prevStmt=$db->prepare("SELECT slug,title FROM posts WHERE id<>? AND published=1 AND (publish_at IS NULL OR publish_at<=?) AND (created_at<? OR (created_at=? AND id<?)) ORDER BY created_at DESC,id DESC LIMIT 1");
@@ -646,7 +659,7 @@ if($action==='comment'){
   json(['ok'=>true,'msg'=>'评论已提交，审核后显示']);
 }
 if($action==='categories'){
-  $stmt=$db->prepare("SELECT c.*,(SELECT COUNT(*)FROM posts p WHERE p.category_id=c.id AND p.published=1 AND p.deleted_at IS NULL AND (p.publish_at IS NULL OR p.publish_at<=?))as post_count FROM categories c ORDER BY c.name");
+  $stmt=$db->prepare("SELECT c.*,(SELECT COUNT(*)FROM post_categories pc JOIN posts p ON p.id=pc.post_id WHERE pc.category_id=c.id AND p.published=1 AND p.deleted_at IS NULL AND (p.publish_at IS NULL OR p.publish_at<=?))as post_count FROM categories c ORDER BY c.name");
   $stmt->execute([$now]);
   json($stmt->fetchAll(PDO::FETCH_ASSOC));
 }
@@ -758,6 +771,8 @@ if($action==='admin_save'&&isAdmin()){
   $check->execute([$slug,$id]);
   if($check->fetchColumn()>0)$slug.='-'.time();
   $excerpt=mb_substr(strip_tags(md($content)),0,200);
+  $catIds=array_values(array_unique(array_filter(array_map('intval',(array)($d['categories']??[])))));
+  if($catIds)$cat=intval($catIds[0]);
 
   if($id>0){
     if($createdAt !== ''){
@@ -778,6 +793,10 @@ if($action==='admin_save'&&isAdmin()){
     $id=$db->lastInsertId();
   }
   savePostTags($db,$id,$tagsStr);
+  $db->prepare("DELETE FROM post_categories WHERE post_id=?")->execute([$id]);
+  $pcIns=$db->prepare("INSERT OR IGNORE INTO post_categories(post_id,category_id)VALUES(?,?)");
+  foreach($catIds as $cid)$pcIns->execute([$id,$cid]);
+  if($cat>0&&!in_array($cat,$catIds,true))$pcIns->execute([$id,$cat]);
   if($pub==1&&(!$publishAtDb||$publishAtDb<=$now)){
     $chk=$db->prepare("SELECT notified FROM posts WHERE id=?");$chk->execute([$id]);
     if(!$chk->fetchColumn()){
@@ -850,7 +869,7 @@ if($action==='admin_remove_tag_global'&&isAdmin()){
 if($action==='admin_get_post'&&isAdmin()){
   csrf_verify();
   $id=intval($_GET['id']??0);$stmt=$db->prepare("SELECT * FROM posts WHERE id=?");$stmt->execute([$id]);$post=$stmt->fetch(PDO::FETCH_ASSOC);
-  if($post){$tagsMap=loadPostTags($db,[$id]);$post['tags']=array_map(function($t){return $t['name'];},$tagsMap[$id]??[]);$post['password_set']=!empty($post['password']);unset($post['password']);}
+  if($post){$tagsMap=loadPostTags($db,[$id]);$post['tags']=array_map(function($t){return $t['name'];},$tagsMap[$id]??[]);$post['categories']=array_map(function($x){return $x['id'];},loadPostCats($db,$id));$post['password_set']=!empty($post['password']);unset($post['password']);}
   json($post?:['error'=>'不存在']);
 }
 if($action==='admin_check_pw'&&isAdmin()){
@@ -877,7 +896,7 @@ if($action==='admin_common_pw_add'&&isAdmin()){
 }
 if($action==='admin_cats'&&isAdmin()){
   csrf_verify();
-  $stmt=$db->query("SELECT c.*,(SELECT COUNT(*)FROM posts p WHERE p.category_id=c.id)as post_count FROM categories c ORDER BY c.sort_order,c.name");json($stmt->fetchAll(PDO::FETCH_ASSOC));
+  $stmt=$db->query("SELECT c.*,(SELECT COUNT(*)FROM post_categories pc WHERE pc.category_id=c.id)as post_count FROM categories c ORDER BY c.sort_order,c.name");json($stmt->fetchAll(PDO::FETCH_ASSOC));
 }
 if($action==='admin_cat_save'&&isAdmin()){
   csrf_verify();
@@ -1470,7 +1489,7 @@ function siteFontCss($db){
 function gearIcon($size=16,$color='currentColor'){
   return '<svg width="'.$size.'" height="'.$size.'" viewBox="0 0 24 24" fill="none" stroke="'.$color.'" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px;margin-right:4px" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
 }
-function ico($name,$size=15){
+function ico($name,$size=15,$color='currentColor'){
   $icons=[
     'home'=>'<path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/>',
     'calendar'=>'<rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
@@ -1509,7 +1528,7 @@ function ico($name,$size=15){
   ];
   $inner=$icons[$name]??'';
   if($inner==='')return '';
-  return '<svg width="'.$size.'" height="'.$size.'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:3px" aria-hidden="true">'.$inner.'</svg>';
+  return '<svg width="'.$size.'" height="'.$size.'" viewBox="0 0 24 24" fill="none" stroke="'.$color.'" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:3px" aria-hidden="true">'.$inner.'</svg>';
 }
 function getPostThumbnail($content,$title){
   global $db;
@@ -1746,7 +1765,7 @@ function makeUniqueSlug($db,$title){
 
 try{$sn=setting($db,'site_name',SITE_NAME);}catch(Exception $e){$sn=SITE_NAME;}
 try{$sd=setting($db,'site_desc');}catch(Exception $e){$sd='';}
-try{$catsStmt=$db->prepare("SELECT c.*,(SELECT COUNT(*)FROM posts p WHERE p.category_id=c.id AND p.published=1 AND (p.publish_at IS NULL OR p.publish_at<=?))as post_count FROM categories c ORDER BY c.sort_order,c.name");$catsStmt->execute([$now]);$cats=$catsStmt->fetchAll(PDO::FETCH_ASSOC);}catch(Exception $e){$cats=[];}
+try{$catsStmt=$db->prepare("SELECT c.*,(SELECT COUNT(*)FROM post_categories pc JOIN posts p ON p.id=pc.post_id WHERE pc.category_id=c.id AND p.published=1 AND p.deleted_at IS NULL AND (p.publish_at IS NULL OR p.publish_at<=?))as post_count FROM categories c ORDER BY c.sort_order,c.name");$catsStmt->execute([$now]);$cats=$catsStmt->fetchAll(PDO::FETCH_ASSOC);}catch(Exception $e){$cats=[];}
 function buildCatTree($cats,$pid=0){
   $tree=[];
   foreach($cats as $c){if(($c['parent_id']??0)==$pid){$c['children']=buildCatTree($cats,$c['id']);$tree[]=$c;}}
@@ -1793,11 +1812,17 @@ if($slug&&!$isAdminPage){
     $cs=$db->prepare("SELECT * FROM comments WHERE post_id=? AND approved=1 ORDER BY created_at ASC");$cs->execute([$singlePost['id']]);
     $singlePost['comments']=$cs->fetchAll(PDO::FETCH_ASSOC);$singlePost['content_html']=md($singlePost['content']);
     $tagsMap=loadPostTags($db,[$singlePost['id']]);$singlePost['tags']=$tagsMap[$singlePost['id']]??[];
+    $singlePost['cats']=array_map(function($x){return $x['name'];},loadPostCats($db,$singlePost['id']));
     $rel=$db->prepare("SELECT DISTINCT p.id,p.slug,p.title,p.excerpt,p.created_at,p.views FROM posts p JOIN post_tags pt ON pt.post_id=p.id WHERE p.id<>? AND p.published=1 AND p.deleted_at IS NULL AND (p.password IS NULL OR p.password='') AND (p.publish_at IS NULL OR p.publish_at<=?) AND pt.tag_id IN (SELECT tag_id FROM post_tags WHERE post_id=?) ORDER BY p.views DESC LIMIT 5");
     $rel->execute([$singlePost['id'],$now,$singlePost['id']]);$singlePost['related']=$rel->fetchAll(PDO::FETCH_ASSOC);
-    if(!$singlePost['related']&&$singlePost['category_id']){
-      $rel=$db->prepare("SELECT p.id,p.slug,p.title,p.excerpt,p.created_at,p.views FROM posts p WHERE p.id<>? AND p.category_id=? AND p.published=1 AND p.deleted_at IS NULL AND (p.password IS NULL OR p.password='') AND (p.publish_at IS NULL OR p.publish_at<=?) ORDER BY p.views DESC LIMIT 5");
-      $rel->execute([$singlePost['id'],$singlePost['category_id'],$now]);$singlePost['related']=$rel->fetchAll(PDO::FETCH_ASSOC);
+    if(!$singlePost['related']){
+      $catQ=$db->prepare("SELECT category_id FROM post_categories WHERE post_id=?");$catQ->execute([$singlePost['id']]);$relCats=$catQ->fetchAll(PDO::FETCH_COLUMN);
+      if($singlePost['category_id']&&!in_array($singlePost['category_id'],$relCats,true))$relCats[]=$singlePost['category_id'];
+      if($relCats){
+        $ph=implode(',',array_fill(0,count($relCats),'?'));
+        $rel=$db->prepare("SELECT DISTINCT p.id,p.slug,p.title,p.excerpt,p.created_at,p.views FROM posts p WHERE p.id<>? AND (p.category_id IN ($ph) OR p.id IN (SELECT pc.post_id FROM post_categories pc WHERE pc.category_id IN ($ph))) AND p.published=1 AND p.deleted_at IS NULL AND (p.publish_at IS NULL OR p.publish_at<=?) ORDER BY p.views DESC LIMIT 5");
+        $rel->execute(array_merge([$singlePost['id']],$relCats,$relCats,[$now]));$singlePost['related']=$rel->fetchAll(PDO::FETCH_ASSOC);
+      }
     }
     $pv=$db->prepare("SELECT slug,title FROM posts WHERE id<>? AND published=1 AND deleted_at IS NULL AND (password IS NULL OR password='') AND (publish_at IS NULL OR publish_at<=?) AND (created_at<? OR (created_at=? AND id<?)) ORDER BY created_at DESC,id DESC LIMIT 1");
     $pv->execute([$singlePost['id'],$now,$singlePost['created_at'],$singlePost['created_at'],$singlePost['id']]);$singlePost['prev']=$pv->fetch(PDO::FETCH_ASSOC);
@@ -1955,6 +1980,18 @@ $latestMore=array_slice($latest,5);
 </div>
 </div>
 <?php endif;?>
+<?php if(isAdmin()):?>
+<div class="aside-card">
+<div class="aside-title"><?=ico('home',15)?> 常用导航</div>
+<div class="aside-list">
+<a href="?admin=posts" class="aside-cat"><?=ico('file-text',14,'#2563eb')?> <span>文章管理</span></a>
+<a href="?admin=trash" class="aside-cat"><?=ico('trash',14,'#ef4444')?> <span>回收站</span></a>
+<a href="?admin=stats" class="aside-cat"><?=ico('chart',14,'#16a34a')?> <span>统计</span></a>
+<a href="?admin=files" class="aside-cat"><?=ico('folder',14,'#f59e0b')?> <span>文件管理</span></a>
+<a href="?admin=settings" class="aside-cat"><?=gearIcon(14,'#8b5cf6')?> <span>系统设置</span></a>
+</div>
+</div>
+<?php endif;?>
 <?php if(!empty($allTags)):?>
     <div class="aside-card">
 <div class="aside-title"><?=ico('tag',15)?> 标签</div>
@@ -2077,7 +2114,8 @@ function includePost($post,$cats,$db){?>
     <span><?=htmlspecialchars((string)($post['cat_name']?:'正文'))?></span>
   </div>
   <article class="single-post" data-id="<?= (int)$post['id'] ?>">
-    <?php if($post['cat_name']):?><span class="cat"><?=htmlspecialchars($post['cat_name'])?></span><?php endif;?>
+    <?php $allCats=array_values(array_unique(array_merge(array_filter([$post['cat_name']??'']),$post['cats']??[])));?>
+    <?php if($allCats):?><div style="display:flex;gap:6px;justify-content:center;flex-wrap:wrap;margin-bottom:10px"><?php foreach($allCats as $cn):?><span class="cat"><?=htmlspecialchars($cn)?></span><?php endforeach;?></div><?php endif;?>
     <ul class="nav-links nav-links-top joe_post__pagination">
       <li class="joe_post__pagination-item prev"><?php if(!empty($post['prev'])):?><a href="?slug=<?=urlencode($post['prev']['slug'])?>" title="<?=htmlspecialchars($post['prev']['title'])?>">上一篇</a><?php endif;?></li>
       <li class="joe_post__pagination-item next"><?php if(!empty($post['next'])):?><a href="?slug=<?=urlencode($post['next']['slug'])?>" title="<?=htmlspecialchars($post['next']['title'])?>">下一篇</a><?php endif;?></li>
@@ -2346,9 +2384,9 @@ footer{margin-top:auto;text-align:center;padding:32px 20px;color:var(--t3);font-
 .modal-actions button:hover{transform:translateY(-1px)}
 .form-row{display:flex;gap:14px}.form-row>*{flex:1}.form-hint{font-size:.75rem;color:var(--t3);margin-top:2px}
 .editor-toolbar button:hover{background:linear-gradient(135deg,var(--g1),var(--g2))!important;color:#fff!important;border-color:transparent!important}
-.content pre{background:#1f242c;color:#e6edf3;padding:16px;border-radius:var(--radius-sm);overflow-x:auto;font-size:1.05rem;line-height:1.7;margin:16px 0;border:1px solid #30363d;position:relative}
+.content pre{background:#f6f8fa;color:#24292f;padding:16px;border-radius:var(--radius-sm);overflow-x:auto;font-size:1.05rem;line-height:1.7;margin:16px 0;border:1px solid rgba(0,0,0,.08);position:relative}
 .content code{background:rgba(110,118,129,.2);color:#ffa657;padding:2px 8px;border-radius:6px;font-size:.92em;font-family:ui-monospace,monospace;font-weight:500}
-.content pre code{background:transparent;padding:0;border-radius:0;color:#e6edf3;font-weight:400}
+.content pre code{background:transparent;padding:0;border-radius:0;color:#24292f;font-weight:400}
 .copy-btn{position:absolute;top:8px;right:8px;padding:5px 12px;font-size:.7rem;background:#21262d;color:#8b949e;border:none;border-radius:6px;cursor:pointer;opacity:0;transition:opacity .2s;font-family:'Inter',system-ui;z-index:10;font-weight:500}
 .copy-btn:hover{background:#30363d;color:#e6edf3}
 .content pre:hover .copy-btn{opacity:1}
@@ -2764,8 +2802,8 @@ header nav .nav-btn.active{background:linear-gradient(135deg,var(--bh),var(--g2)
 .warm input:focus,.warm select:focus,.warm textarea:focus{border-color:#fb6c28;box-shadow:0 0 0 3px rgba(251,108,40,.15)}
 .warm .single-post .content blockquote{border-left-color:#fb6c28}
 .warm .single-post .content a{color:#fb6c28}
-.warm .single-post .content pre{background:#3b2b26;border-color:var(--border)}
-.warm .editormd .editormd-preview-container pre{background:#3b2b26;border-color:var(--border)}
+.warm .single-post .content pre{background:#fdf0e9;border-color:rgba(124,45,18,.12)}
+.warm .editormd .editormd-preview-container pre{background:#fdf0e9;border-color:rgba(124,45,18,.12)}
 .warm .editormd .editormd-preview-container blockquote{border-left-color:#fb6c28}
 .warm .editormd .CodeMirror-cursor{border-left-color:#fb6c28!important}
 .warm .editormd .CodeMirror-selected{background:rgba(251,108,40,.2)!important}
@@ -2812,8 +2850,8 @@ header nav .nav-btn.active{background:linear-gradient(135deg,var(--bh),var(--g2)
 .blue input:focus,.blue select:focus,.blue textarea:focus{border-color:#2563eb;box-shadow:0 0 0 3px rgba(37,99,235,.15)}
 .blue .single-post .content blockquote{border-left-color:#2563eb}
 .blue .single-post .content a{color:#2563eb}
-.blue .single-post .content pre{background:#1f242c;border-color:var(--border)}
-.blue .editormd .editormd-preview-container pre{background:#1f242c;border-color:var(--border)}
+.blue .single-post .content pre{background:#f6f8fa;border-color:rgba(0,0,0,.08)}
+.blue .editormd .editormd-preview-container pre{background:#f6f8fa;border-color:rgba(0,0,0,.08)}
 .blue .editormd .editormd-preview-container blockquote{border-left-color:#2563eb}
 .blue .editormd .CodeMirror-cursor{border-left-color:#2563eb!important}
 .blue .editormd .CodeMirror-selected{background:rgba(37,99,235,.2)!important}
@@ -2852,6 +2890,16 @@ header nav .nav-btn.active{background:linear-gradient(135deg,var(--bh),var(--g2)
 @media(min-width:768px){
   .single-post .content img,.editormd-preview-container img{max-width:82%!important;margin-left:auto!important;margin-right:auto!important;display:block!important}
 }
+/* 编辑器分类下拉多选 */
+.cat-drop-select{position:relative}
+.cat-drop-select #catDropBtn{width:100%;text-align:left;padding:8px 10px;border:1px solid #e0e6ed;border-radius:10px;background:var(--card);color:var(--t1);font-size:.82rem;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cat-drop-panel{display:none;position:absolute;left:0;top:calc(100%+4px);width:min(260px,100%);background:var(--card);border:1px solid #e0e6ed;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.12);max-height:128px;overflow:auto;z-index:60;padding:4px}
+.cat-drop-panel.show{display:block}
+.cat-drop-panel label{display:flex;align-items:center;gap:8px;min-height:30px;padding:0 10px;font-size:.82rem;cursor:pointer;border-radius:8px;box-sizing:border-box;margin:0}
+.cat-drop-panel .cat-opt-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cat-drop-panel input[type=checkbox]{flex:none;margin:0;width:15px;height:15px;accent-color:var(--b)}
+.cat-drop-panel label:hover{background:rgba(0,0,0,.05)}
+.dark .cat-drop-panel label:hover{background:rgba(255,255,255,.08)}
 </style>
   <?php if(isAdmin()):?>
   <link rel="stylesheet" href="editormd/css/editormd.min.css" />
@@ -2866,16 +2914,26 @@ header nav .nav-btn.active{background:linear-gradient(135deg,var(--bh),var(--g2)
   <script src="editormd/lib/mermaid.min.js"></script>
   <?php endif;?>
   <style>
-  .single-post .content pre,.single-post .content .hljs{background:#1f242c;color:#e6edf3}
-  .single-post .content .hljs-comment,.single-post .content .hljs-quote,.single-post .content .hljs-meta{color:#8b949e}
-  .single-post .content .hljs-keyword,.single-post .content .hljs-selector-tag,.single-post .content .hljs-literal,.single-post .content .hljs-section,.single-post .content .hljs-link{color:#ff7b72}
-  .single-post .content .hljs-string,.single-post .content .hljs-regexp,.single-post .content .hljs-addition{color:#a5d6ff}
-  .single-post .content .hljs-number,.single-post .content .hljs-symbol,.single-post .content .hljs-bullet{color:#79c0ff}
-  .single-post .content .hljs-title,.single-post .content .hljs-title.function_,.single-post .content .hljs-title.class_{color:#d2a8ff}
-  .single-post .content .hljs-attr,.single-post .content .hljs-variable,.single-post .content .hljs-template-variable,.single-post .content .hljs-name{color:#79c0ff}
-  .single-post .content .hljs-built_in,.single-post .content .hljs-builtin-name,.single-post .content .hljs-type,.single-post .content .hljs-attribute{color:#ffa657}
-  .single-post .content .hljs-deletion{color:#ffa198;background:rgba(255,45,85,.15)}
-  .single-post .content .hljs-addition{color:#7ee787;background:rgba(46,160,67,.15)}
+.single-post .content pre,.single-post .content .hljs{background:#f6f8fa;color:#24292f;border:1px solid rgba(0,0,0,.08)}
+.single-post .content .hljs-comment,.single-post .content .hljs-quote,.single-post .content .hljs-meta{color:#6e7781}
+.single-post .content .hljs-keyword,.single-post .content .hljs-selector-tag,.single-post .content .hljs-literal,.single-post .content .hljs-section,.single-post .content .hljs-link{color:#cf222e}
+.single-post .content .hljs-string,.single-post .content .hljs-regexp,.single-post .content .hljs-addition{color:#0a3069}
+.single-post .content .hljs-number,.single-post .content .hljs-symbol,.single-post .content .hljs-bullet{color:#0550ae}
+.single-post .content .hljs-title,.single-post .content .hljs-title.function_,.single-post .content .hljs-title.class_{color:#8250df}
+.single-post .content .hljs-attr,.single-post .content .hljs-variable,.single-post .content .hljs-template-variable,.single-post .content .hljs-name{color:#0550ae}
+.single-post .content .hljs-built_in,.single-post .content .hljs-builtin-name,.single-post .content .hljs-type,.single-post .content .hljs-attribute{color:#953800}
+.single-post .content .hljs-deletion{color:#82071e;background:rgba(255,129,130,.2)}
+.single-post .content .hljs-addition{color:#116329;background:rgba(26,127,55,.15)}
+.dark .single-post .content pre,.dark .single-post .content .hljs{background:#1f242c;color:#e6edf3;border-color:var(--border)}
+.dark .single-post .content .hljs-comment,.dark .single-post .content .hljs-quote,.dark .single-post .content .hljs-meta{color:#8b949e}
+.dark .single-post .content .hljs-keyword,.dark .single-post .content .hljs-selector-tag,.dark .single-post .content .hljs-literal,.dark .single-post .content .hljs-section,.dark .single-post .content .hljs-link{color:#ff7b72}
+.dark .single-post .content .hljs-string,.dark .single-post .content .hljs-regexp,.dark .single-post .content .hljs-addition{color:#a5d6ff}
+.dark .single-post .content .hljs-number,.dark .single-post .content .hljs-symbol,.dark .single-post .content .hljs-bullet{color:#79c0ff}
+.dark .single-post .content .hljs-title,.dark .single-post .content .hljs-title.function_,.dark .single-post .content .hljs-title.class_{color:#d2a8ff}
+.dark .single-post .content .hljs-attr,.dark .single-post .content .hljs-variable,.dark .single-post .content .hljs-template-variable,.dark .single-post .content .hljs-name{color:#79c0ff}
+.dark .single-post .content .hljs-built_in,.dark .single-post .content .hljs-builtin-name,.dark .single-post .content .hljs-type,.dark .single-post .content .hljs-attribute{color:#ffa657}
+.dark .single-post .content .hljs-deletion{color:#ffa198;background:rgba(255,45,85,.15)}
+.dark .single-post .content .hljs-addition{color:#7ee787;background:rgba(46,160,67,.15)}
   </style>
 </head><body>
 <div id="readingBar"></div>
@@ -3316,14 +3374,38 @@ function bindSlugFollow(origTitle,origSlug){
   sb.oninput=function(){window._slugManual=true;};
   tb.oninput=function(){if(!window._slugManual){sb.value=slugifyTitle(tb.value);}};
 }
+function updateMainCat(){
+  var cb=document.querySelector('.postCatCb:checked');
+  var h=document.getElementById('postCat');if(h)h.value=cb?cb.value:'';
+  var b=document.getElementById('catDropBtn');
+  if(b){
+    var names=[];document.querySelectorAll('.postCatCb:checked').forEach(function(c){names.push(c.parentElement.textContent.trim());});
+    b.textContent=names.length?('已选 '+names.length+' 个：'+names.join('、')):'点击选择分类 ▾';
+    b.style.color=names.length?'var(--b)':'';
+  }
+}
+function toggleCatDrop(e){
+  if(e){e.stopPropagation();}
+  var p=document.getElementById('catDropPanel');if(p)p.classList.toggle('show');
+}
+document.addEventListener('click',function(e){
+  var box=document.querySelector('.cat-drop-select');
+  var p=document.getElementById('catDropPanel');
+  if(p&&box&&!box.contains(e.target))p.classList.remove('show');
+});
+function setPostCats(ids){
+  var list=(ids||[]).map(function(x){return parseInt(x,10)});
+  document.querySelectorAll('.postCatCb').forEach(function(cb){cb.checked=list.indexOf(parseInt(cb.value,10))>=0;});
+  updateMainCat();
+}
 function openEditor(id,fromTrash){
   id=id||0;fromTrash=fromTrash?1:0;
   ensureMermaid();
   apiFetch('?action=admin_cats').then(function(r){return r.json()}).then(function(cats){
-    var catOpts='<option value="">未分类</option>';
-    function addCatOpts(pid,prefix){cats.forEach(function(c){if((c.parent_id||0)==pid){catOpts+='<option value="'+c.id+'">'+prefix+escapeHtml(c.name)+'</option>';addCatOpts(c.id,prefix+'　');}});}
+    var catOpts='';
+    function addCatOpts(pid,prefix){cats.forEach(function(c){if((c.parent_id||0)==pid){catOpts+='<label><input type="checkbox" class="postCatCb" value="'+c.id+'" onchange="updateMainCat()"><span class="cat-opt-name">'+prefix+escapeHtml(c.name)+'</span></label>';addCatOpts(c.id,prefix+'　');}});}
     addCatOpts(0,'');
-  var html='<h2>'+(id?'编辑文章':'写新文章')+'</h2>'+(fromTrash?'<div style="background:#fff7ed;color:#b45309;border:1px solid #fcd34d;border-radius:8px;padding:8px 12px;font-size:.78rem;margin:0 0 10px"><?=ico('alert',14)?> 此文章在回收站中：下方三个按钮里，只有“保存修改/修改后发布”才会保存并自动恢复文章；点“取消”或直接关闭编辑器都不会保存，删除状态保持不变。</div>':'')+'<label>标题</label><input type="text" id="postTitle" placeholder="文章标题"><div class="form-row"><div><label>分类</label><select id="postCat">'+catOpts+'</select></div><div><label>状态</label><select id="postStatus"><option value="1">已发布</option><option value="0">草稿</option></select></div><div><label>发表时间</label><input type="date" id="postTime"></div></div><div class="form-row"><div><label>定时发布 <span class="form-hint">可选</span></label><input type="datetime-local" id="postPublish"></div><div><label>标签 <span class="form-hint">逗号分隔</span></label><input type="text" id="postTags" placeholder="PHP, JavaScript"></div><div><label>访问密码 <span class="form-hint">留空公开</span></label><input type="password" id="postPassword" placeholder="留空公开" autocomplete="new-password"><select id="commonPwSelect" onchange="fillCommonPw(this.value)" style="margin-left:8px;padding:6px 10px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.75rem"></select><button type="button" onclick="saveCommonPw()" style="margin-left:4px;padding:6px 12px;border-radius:40px;border:1px solid #e0e6ed;background:#eef2ff;color:var(--b);font-size:.75rem;cursor:pointer">存为常用</button></div></div><label>Slug <span class="form-hint">修改标题后自动跟随，可手动修改</span></label><input type="text" id="postSlug" placeholder="修改标题后自动生成"><div id="draftHint" style="font-size:.75rem;color:var(--t3);margin:4px 0;display:none"></div><label>内容 (支持 Markdown)</label><div class="editor-toolbar" style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">'+
+  var html='<h2>'+(id?'编辑文章':'写新文章')+'</h2>'+(fromTrash?'<div style="background:#fff7ed;color:#b45309;border:1px solid #fcd34d;border-radius:8px;padding:8px 12px;font-size:.78rem;margin:0 0 10px"><?=ico('alert',14)?> 此文章在回收站中：下方三个按钮里，只有“保存修改/修改后发布”才会保存并自动恢复文章；点“取消”或直接关闭编辑器都不会保存，删除状态保持不变。</div>':'')+'<label>标题</label><input type="text" id="postTitle" placeholder="文章标题"><div class="form-row"><div style="flex:0 1 220px;min-width:170px"><label>分类（可多选）</label><div class="cat-drop-select"><button type="button" id="catDropBtn" onclick="toggleCatDrop(event)">点击选择分类 ▾</button><div class="cat-drop-panel" id="catDropPanel">'+catOpts+'</div></div><input type="hidden" id="postCat" value=""></div><div><label>状态</label><select id="postStatus"><option value="1">已发布</option><option value="0">草稿</option></select></div><div><label>发表时间</label><input type="date" id="postTime"></div></div><div class="form-row"><div><label>定时发布 <span class="form-hint">可选</span></label><input type="datetime-local" id="postPublish"></div><div><label>标签 <span class="form-hint">逗号分隔</span></label><input type="text" id="postTags" placeholder="PHP, JavaScript"></div><div><label>访问密码 <span class="form-hint">留空公开</span></label><input type="password" id="postPassword" placeholder="留空公开" autocomplete="new-password"><select id="commonPwSelect" onchange="fillCommonPw(this.value)" style="margin-left:8px;padding:6px 10px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.75rem"></select><button type="button" onclick="saveCommonPw()" style="margin-left:4px;padding:6px 12px;border-radius:40px;border:1px solid #e0e6ed;background:#eef2ff;color:var(--b);font-size:.75rem;cursor:pointer">存为常用</button></div></div><label>Slug <span class="form-hint">修改标题后自动跟随，可手动修改</span></label><input type="text" id="postSlug" placeholder="修改标题后自动生成"><div id="draftHint" style="font-size:.75rem;color:var(--t3);margin:4px 0;display:none"></div><label>内容 (支持 Markdown)</label><div class="editor-toolbar" style="display:flex;gap:6px;margin-bottom:6px;flex-wrap:wrap">'+
       '<button type="button" onclick="editorUpload(\'image\')" class="btn- btn-upload" style="padding:6px 14px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.82rem;cursor:pointer;font-weight:500">📷 上传图片</button>'+
 '<button type="button" onclick="editorUpload(\'file\')" class="btn- btn-upload" style="padding:6px 14px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.82rem;cursor:pointer;font-weight:500"><?=ico('paperclip',13)?> 上传文件</button>'+
 '<button type="button" onclick="insertVideo()" class="btn- btn-upload" style="padding:6px 14px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.82rem;cursor:pointer;font-weight:500"><?=ico('video',13)?> 视频</button><label style="margin-left:8px;font-size:.75rem;color:var(--t3);display:inline-flex;align-items:center;gap:4px">字号<select id="editorFontSize" onchange="applyFontToSelection(this.value)" style="padding:6px 10px;border-radius:40px;border:1px solid #e0e6ed;background:var(--card);color:var(--t1);font-size:.78rem"><option value="12">12</option><option value="13">13</option><option value="14">14</option><option value="15" selected>15</option><option value="16">16</option><option value="18">18</option><option value="20">20</option><option value="22">22</option><option value="24">24</option></select></label><label style="margin-left:8px;font-size:.75rem;color:var(--t3);display:inline-flex;align-items:center;gap:4px">颜色<input type="color" id="editorColor" value="#2563eb" onchange="applyColorToSelection(this.value)" oninput="applyColorToSelection(this.value)" style="width:32px;height:26px;padding:0;border:1px solid #e0e6ed;border-radius:8px;background:var(--card);cursor:pointer"></label>'+
@@ -3364,7 +3446,7 @@ function openEditor(id,fromTrash){
         if(p.title){
           document.getElementById('postTitle').value=p.title;
           bindSlugFollow(p.title,p.slug);
-          document.getElementById('postCat').value=p.category_id||'';
+          setPostCats(p.categories&&p.categories.length?p.categories:(p.category_id?[p.category_id]:[]));
           document.getElementById('postStatus').value=p.published;
           document.getElementById('postContent').value=p.content;
           var t = p.created_at ? p.created_at.substring(0, 10) : '';
@@ -3385,6 +3467,7 @@ function restoreDraft(id){
     if(!saved||!saved.savedAt||Date.now()-saved.savedAt>=7*24*3600*1000)return;
     var set=function(n,v){var el=document.getElementById(n);if(el&&v!==undefined&&v!==null)el.value=v;};
     set('postTitle',saved.title);set('postSlug',saved.slug);set('postTags',saved.tags);set('postCat',saved.cat||0);set('postStatus',saved.pub||1);set('postTime',saved.time);set('postPublish',saved.publish);
+    if(saved.cats&&saved.cats.length){document.querySelectorAll('.postCatCb').forEach(function(cb){cb.checked=saved.cats.indexOf(parseInt(cb.value,10))>=0;});updateMainCat();}
     if(saved.content!==undefined)document.getElementById('postContent').value=saved.content;
     var dh=document.getElementById('draftHint');if(dh){dh.style.display='block';dh.textContent='已恢复本地自动保存草稿';}
   }catch(e){}
@@ -3393,7 +3476,7 @@ function saveDraft(id){
   try{
     var key='miniblog_draft_'+(id||'new');
     var content=window._editor&&typeof window._editor.getMarkdown==='function'?window._editor.getMarkdown():document.getElementById('postContent')?.value||'';
-    localStorage.setItem(key,JSON.stringify({savedAt:Date.now(),title:document.getElementById('postTitle')?.value||'',slug:document.getElementById('postSlug')?.value||'',tags:document.getElementById('postTags')?.value||'',cat:document.getElementById('postCat')?.value||'',pub:document.getElementById('postStatus')?.value||'',time:document.getElementById('postTime')?.value||'',publish:document.getElementById('postPublish')?.value||'',password:document.getElementById('postPassword')?.value||'',content:content}));
+    localStorage.setItem(key,JSON.stringify({savedAt:Date.now(),title:document.getElementById('postTitle')?.value||'',slug:document.getElementById('postSlug')?.value||'',tags:document.getElementById('postTags')?.value||'',cat:document.getElementById('postCat')?.value||'',cats:Array.from(document.querySelectorAll('.postCatCb:checked')).map(function(cb){return parseInt(cb.value,10);}),pub:document.getElementById('postStatus')?.value||'',time:document.getElementById('postTime')?.value||'',publish:document.getElementById('postPublish')?.value||'',password:document.getElementById('postPassword')?.value||'',content:content}));
     var h=document.getElementById('draftHint');if(h){h.style.display='block';h.textContent='草稿已自动保存 '+new Date().toLocaleTimeString();}
   }catch(e){}
 }
@@ -3449,6 +3532,8 @@ function savePost(id, forcePublish){
 }
 function doSavePost(id,title,slug,content){
   var cat=document.getElementById('postCat')?.value||0;
+  var cats=[];
+  document.querySelectorAll('.postCatCb:checked').forEach(function(cb){cats.push(parseInt(cb.value,10));});
   var pub=document.getElementById('postStatus')?.value||1;
   var timeEl=document.getElementById('postTime');
   var timeStr=timeEl ? timeEl.value : '';  // 格式 "2025-01-01"（仅日期）
@@ -3465,6 +3550,7 @@ function doSavePost(id,title,slug,content){
       title:title,
       slug:slug,
       content:content,
+      categories:cats,
       category_id:cat,
       published:pub,
       created_at:timeStr,   // 留空则使用默认时间
