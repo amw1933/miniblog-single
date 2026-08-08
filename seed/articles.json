@@ -1,0 +1,22 @@
+[
+  {
+    "title": "Alpine系统NPS 穿透服务端完美安装指南",
+    "slug": "alpine-nps",
+    "content": "\n本方法不依赖任何不稳定的一键脚本，采用官方原版加 Alpine 自启固化，100% 成功。\n\n### 步骤 1：下载并补齐正版官方组件\n```bash\n# 1. 创建并进入官方配置目录\nmkdir -p /etc/nps && cd /etc/nps\n\n# 2. 从官方源下载最新稳定版发布包（以 v0.26.10 为例）\nwget https://github.com/ehang-io/nps/releases/download/v0.26.10/linux_amd64_server.tar.gz\n\n# 3. 解压并补齐所有核心与网页静态文件\ntar -zxvf linux_amd64_server.tar.gz\ncp -r web /\n\n# 4. 把主程序移动到系统全局变量中，并赋予最高执行与读取权限\nmv nps /usr/bin/\nchmod +x /usr/bin/nps\nchmod -R 755 /etc/nps/web\nchmod -R 755 /web\n```\n### 步骤 2：修改端口避免冲突（最核心）\n\n默认的 80 和 443 极易与 Nginx 撞车。直接修改配置文件：\nvi /etc/nps/conf/nps.conf\n```bash\nvi /etc/nps/conf/nps.conf\n```\n找到以下几行并修改（按 i 编辑，修改后按 Esc 输入 :wq 保存）：\n\n```bash\n# 修改前：http_proxy_port=80  -> 修改后：\nhttp_proxy_port=8088\n\n# 修改前：https_proxy_port=443 -> 修改后：\nhttps_proxy_port=8443\n\n# 网页管理后台端口，可保持 8081 不变\nweb_port=8081\n```\n### 步骤 3：配置 Alpine 开机自动启动\n\n由于 Alpine 没有 standard systemd，直接写入本地自启守候列表：\n```bash\n# 1. 创建自启文件并写入绝对启动命令\ncat > /etc/local.d/nps.start << 'EOF'\n#!/bin/sh\nnps start\nEOF\n\n# 2. 赋予执行权限并校准格式\nchmod +x /etc/local.d/nps.start\nsed -i 's/\\r$//' /etc/local.d/nps.start\n\n# 3. 激活 Alpine 本地自启服务（如果未激活）\nrc-update add local default\n```\n### 步骤 4：放行云厂商公网防火墙\n\n去你的云服务器控制台（阿里云/腾讯云等），在“安全组/防火墙”中添加两条入站规则：\n\n放行 TCP 端口 8081（NPS 后台网页管理）放行 TCP 端口 8024（NPS 客户端连接核心桥梁）",
+    "excerpt": "\n本方法不依赖任何不稳定的一键脚本，采用官方原版加 Alpine 自启固化，100% 成功。\n\n步骤 1：下载并补齐正版官方组件\n# 1. 创建并进入官方配置目录\nmkdir -p /etc/nps &amp;&amp; cd /etc/nps\n\n# 2. 从官方源下载最新稳定版发布包（以 v0.26.10 为例）\nwget https://github.com/ehang-io/nps/rele",
+    "category": "Linux",
+    "tags": [],
+    "created_at": "2026-06-06 00:00:00",
+    "updated_at": "2026-08-02 16:40:34"
+  },
+  {
+    "title": "Alpine 系统使用甬哥 Sing-box 代理完美部署与开机自启",
+    "slug": "alpine-sing-box",
+    "content": "甬哥的脚本在普通 Linux 上很省心，但在 Alpine 系统上需要额外“人工喂饭”才能完美自启。\n\n### 步骤 1：安装 Bash 依赖并运行脚本\nAlpine 默认没有 Bash，必须手动先补齐，否则甬哥脚本会直接报错死锁：\n```asp\n# 1. 补齐核心脚本环境依赖\napk update\napk add bash wget curl openssl shadow\n\n# 2. 运行甬哥官方原生一键脚本（代码随快捷方式自动生成）\nbash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)\n```\n(在脚本弹出的蓝底菜单中，根据提示一路顺着安装好你的节点协议即可)\n### 步骤 2：强行修复 Alpine 下的开机不自启\n由于甬哥脚本无法将自启服务注册进 Alpine 独有的 OpenRC 机制，我们直接强行将其追加进前面已经打通的 local.d 自动化通道中：\n```bash\n# 1. 将绝对物理启动命令无缝追加到自启脚本末尾\ncat >> /etc/local.d/nps.start << 'EOF'\nrc-service sing-box start 2>/dev/null\nnohup sing-box run -c /etc/sing-box/config.json >/dev/null 2>&1 &\nEOF\n\n# 2. 再次执行全身格式校准，防止隐藏字符导致脚本卡死\nsed -i 's/\\r$//' /etc/local.d/nps.start\nchmod +x /etc/local.d/nps.start\n```\n33",
+    "excerpt": "甬哥的脚本在普通 Linux 上很省心，但在 Alpine 系统上需要额外“人工喂饭”才能完美自启。\n\n步骤 1：安装 Bash 依赖并运行脚本\nAlpine 默认没有 Bash，必须手动先补齐，否则甬哥脚本会直接报错死锁：\n# 1. 补齐核心脚本环境依赖\napk update\napk add bash wget curl openssl shadow\n\n# 2. 运行甬哥官方原生一键脚本（代码随",
+    "category": null,
+    "tags": [],
+    "created_at": "2026-06-06 00:00:00",
+    "updated_at": "2026-08-02 16:41:25"
+  }
+]
