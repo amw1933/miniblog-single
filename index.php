@@ -97,6 +97,7 @@ try{
   try{$db->exec("SELECT deleted_at FROM posts LIMIT 1");}catch(Exception $e){$db->exec("ALTER TABLE posts ADD COLUMN deleted_at DATETIME");}
   try{$db->exec("SELECT password FROM posts LIMIT 1");}catch(Exception $e){$db->exec("ALTER TABLE posts ADD COLUMN password TEXT");}
   try{$db->exec("SELECT notified FROM posts LIMIT 1");}catch(Exception $e){$db->exec("ALTER TABLE posts ADD COLUMN notified INTEGER DEFAULT 0");}
+  try{$db->exec("SELECT pinned FROM posts LIMIT 1");}catch(Exception $e){$db->exec("ALTER TABLE posts ADD COLUMN pinned INTEGER DEFAULT 0");}
   try{$db->exec("SELECT ip FROM comments LIMIT 1");}catch(Exception $e){$db->exec("ALTER TABLE comments ADD COLUMN ip TEXT");}
   try{$db->exec("SELECT ua FROM comments LIMIT 1");}catch(Exception $e){$db->exec("ALTER TABLE comments ADD COLUMN ua TEXT");}
   $db->exec('CREATE TABLE IF NOT EXISTS remote_image_cache(url TEXT PRIMARY KEY,local TEXT NOT NULL,size INTEGER DEFAULT 0,created_at DATETIME DEFAULT CURRENT_TIMESTAMP)');
@@ -108,6 +109,7 @@ $db->exec('CREATE TABLE IF NOT EXISTS post_categories(post_id INTEGER NOT NULL,c
 $db->exec('CREATE INDEX IF NOT EXISTS idx_post_categories_cat ON post_categories(category_id)');
 try{$db->exec('INSERT OR IGNORE INTO post_categories(post_id,category_id) SELECT id,category_id FROM posts WHERE category_id>0');}catch(Exception $e){}
   $db->exec('CREATE TABLE IF NOT EXISTS stats_daily(date TEXT PRIMARY KEY,pv INTEGER DEFAULT 0,uv INTEGER DEFAULT 0,posts INTEGER DEFAULT 0)');
+  $db->exec('CREATE TABLE IF NOT EXISTS visit_ips(ip TEXT NOT NULL,day TEXT NOT NULL,visits INTEGER DEFAULT 1,ua TEXT,first_at DATETIME,last_at DATETIME,PRIMARY KEY(ip,day))');
   $db->exec('CREATE TABLE IF NOT EXISTS admin_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,action TEXT NOT NULL,detail TEXT,ip TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP)');
   $db->exec('CREATE TABLE IF NOT EXISTS comment_blacklist(ip TEXT PRIMARY KEY,note TEXT,created_at DATETIME DEFAULT CURRENT_TIMESTAMP)');
   $db->exec('CREATE TABLE IF NOT EXISTS search_log(keyword TEXT PRIMARY KEY,hits INTEGER DEFAULT 0,last_at DATETIME)');
@@ -309,6 +311,20 @@ function trackVisit($db){
   $newUv=(empty($_SESSION['uv_date'])||$_SESSION['uv_date']!==$today)?1:0;
   $db->prepare("UPDATE stats_daily SET pv=pv+1,uv=uv+? WHERE date=?")->execute([$newUv,$today]);
   $_SESSION['uv_date']=$today;
+  $ip=trim($_SERVER['REMOTE_ADDR']??'');
+  foreach(['HTTP_X_REAL_IP','HTTP_CF_CONNECTING_IP'] as $k){
+    if(!empty($_SERVER[$k])&&filter_var(trim($_SERVER[$k]),FILTER_VALIDATE_IP)){$ip=trim($_SERVER[$k]);break;}
+  }
+  if(!empty($_SERVER['HTTP_X_FORWARDED_FOR'])){
+    $xff=trim(explode(',',$_SERVER['HTTP_X_FORWARDED_FOR'])[0]);
+    if(filter_var($xff,FILTER_VALIDATE_IP))$ip=$xff;
+  }
+  if($ip===''||strlen($ip)>64||!filter_var($ip,FILTER_VALIDATE_IP))$ip='0.0.0.0';
+  $ua=mb_substr(trim($_SERVER['HTTP_USER_AGENT']??''),0,150);
+  $nowSql=date('Y-m-d H:i:s');
+  $db->prepare("INSERT OR IGNORE INTO visit_ips(ip,day,visits,ua,first_at,last_at)VALUES(?,?,1,?,?,?)")->execute([$ip,$today,$ua,$nowSql,$nowSql]);
+  $db->prepare("UPDATE visit_ips SET visits=visits+1,ua=?,last_at=? WHERE ip=? AND day=?")->execute([$ua,$nowSql,$ip,$today]);
+  if(mt_rand(1,100)===1)$db->exec("DELETE FROM visit_ips WHERE day < date('now','-90 days')");
 }
 
 function sendNotify($db,$title,$body,$link='',$telegram=false){
@@ -361,6 +377,7 @@ function postWords($content){
 function backupFileSet(){
   $root=__DIR__;
   $map=['index.php'=>__FILE__];
+  foreach(['robots.txt','sitemap.xml'] as $rel){$abs=$root.'/'.$rel;if(is_file($abs))$map[$rel]=$abs;}
   foreach(glob($root.'/data/*.db')?:[] as $f)$map['data/'.basename($f)]=$f;
   foreach(['data/.htaccess','uploads/.htaccess'] as $rel){$abs=$root.'/'.$rel;if(is_file($abs))$map[$rel]=$abs;}
   foreach(['editormd','fonts','uploads'] as $dir){
@@ -561,7 +578,7 @@ if($action==='posts'){ try{
     $params[]=$tagSlug;
   }
   $total=$db->prepare("SELECT COUNT(*)FROM posts p $where");$total->execute($params);$total=$total->fetchColumn();
-  $stmt=$db->prepare("SELECT p.*,c.name as cat_name,(SELECT COUNT(*) FROM comments cm WHERE cm.post_id=p.id AND cm.approved=1) as comment_count FROM posts p LEFT JOIN categories c ON p.category_id=c.id $where ORDER BY p.created_at DESC LIMIT ? OFFSET ?");
+  $stmt=$db->prepare("SELECT p.*,c.name as cat_name,(SELECT COUNT(*) FROM comments cm WHERE cm.post_id=p.id AND cm.approved=1) as comment_count FROM posts p LEFT JOIN categories c ON p.category_id=c.id $where ORDER BY p.pinned DESC,p.created_at DESC LIMIT ? OFFSET ?");
   $params[]=POSTS_PER_PAGE;$params[]=$offset;$stmt->execute($params);
   $posts=$stmt->fetchAll(PDO::FETCH_ASSOC);
   $tagsMap=loadPostTags($db,array_column($posts,'id'));
@@ -584,7 +601,7 @@ if($action==='post'){
   unset($post['password']);
   $db->prepare("UPDATE posts SET views=views+1 WHERE id=?")->execute([$post['id']]);
   trackVisit($db);
-  $post['content_html']=md($post['content']);
+  $post['content_html']=mdWithAlt($post['content'],$post['title']);
   $wc=postWords($post['content']);$post['words']=$wc['words'];$post['minutes']=$wc['minutes'];
   $cs=$db->prepare("SELECT * FROM comments WHERE post_id=? AND approved=1 ORDER BY created_at ASC");$cs->execute([$post['id']]);
   $post['comments']=$cs->fetchAll(PDO::FETCH_ASSOC);
@@ -677,19 +694,33 @@ if($action==='rss'){
   foreach($posts as $p){$link=SITE_URL.'/?slug='.urlencode($p['slug']);echo '<item><title>'.htmlspecialchars($p['title']).'</title><link>'.$link.'</link><guid>'.$link.'</guid><description>'.htmlspecialchars(strip_tags(md($p['content']))).'</description></item>';}
   echo '</channel></rss>';exit;
 }
-if($action==='sitemap'){
-  header('Content-Type:application/xml;charset=utf-8');
+function buildSitemapXml($db){
+  $now=date('Y-m-d H:i:s');
   $stmt=$db->prepare("SELECT slug,updated_at FROM posts WHERE published=1 AND deleted_at IS NULL AND (password IS NULL OR password='') AND (publish_at IS NULL OR publish_at<=?) ORDER BY updated_at DESC");
   $stmt->execute([$now]);$posts=$stmt->fetchAll(PDO::FETCH_ASSOC);
-  echo '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>'.htmlspecialchars(SITE_URL.'/').'</loc><priority>1.0</priority></url>';
-  foreach($posts as $p)echo '<url><loc>'.htmlspecialchars(SITE_URL.'/?slug='.urlencode($p['slug'])).'</loc><lastmod>'.substr($p['updated_at'],0,10).'</lastmod><priority>0.8</priority></url>';
+  $xml='<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>'.htmlspecialchars(SITE_URL.'/').'</loc><priority>1.0</priority></url>';
+  foreach($posts as $p)$xml.='<url><loc>'.htmlspecialchars(SITE_URL.'/?slug='.urlencode($p['slug'])).'</loc><lastmod>'.substr($p['updated_at'],0,10).'</lastmod><priority>0.8</priority></url>';
   $ts=$db->query("SELECT slug FROM tags ORDER BY id")->fetchAll(PDO::FETCH_COLUMN);
-  foreach($ts as $tag)echo '<url><loc>'.htmlspecialchars(SITE_URL.'/?tag='.urlencode($tag)).'</loc><priority>0.5</priority></url>';
-  echo '</urlset>';exit;
+  foreach($ts as $tag)$xml.='<url><loc>'.htmlspecialchars(SITE_URL.'/?tag='.urlencode($tag)).'</loc><priority>0.5</priority></url>';
+  return $xml.'</urlset>';
+}
+function regenerateSitemapFile($db){
+  $ok=@file_put_contents(__DIR__.'/sitemap.xml',buildSitemapXml($db));
+  return $ok!==false;
+}
+if($action==='sitemap'){
+  header('Content-Type:application/xml;charset=utf-8');
+  echo buildSitemapXml($db);exit;
 }
 if($action==='robots'){
   header('Content-Type:text/plain;charset=utf-8');
-  echo "User-agent: *\nAllow: /\nDisallow: /data/\nDisallow: /?admin=\nSitemap: ".SITE_URL."/?action=sitemap\n";exit;
+  echo "User-agent: *\nAllow: /\nDisallow: /data/\nDisallow: /?admin=\nDisallow: /?action=login\nDisallow: /?action=logout\nDisallow: /?action=admin_\nDisallow: /?action=process_paste\nDisallow: /?action=render_md\nSitemap: ".SITE_URL."/?action=sitemap\n";exit;
+}
+if($action==='admin_regen_sitemap'&&isAdmin()){
+  csrf_verify();
+  $ok=regenerateSitemapFile($db);
+  addLog($db,'sitemap_regen','重新生成 sitemap.xml'.($ok?'':'（目录不可写，生成失败）'));
+  json(['ok'=>true,'written'=>$ok]);
 }
 if($action==='favicon'){
   $favThemes=['blue'=>['#2563eb','#7c3aed'],'warm'=>['#ff8a3d','#ff4e6b'],'light'=>['#ff8a3d','#ff4e6b'],'dark'=>['#a78bfa','#6366f1']];
@@ -722,11 +753,19 @@ if($action==='admin_posts'&&isAdmin()){
   csrf_verify();
   $page=max(1,intval($_GET['page']??1));$offset=($page-1)*POSTS_PER_PAGE;
   $total=$db->query("SELECT COUNT(*)FROM posts WHERE deleted_at IS NULL")->fetchColumn();
-  $stmt=$db->prepare("SELECT p.*,c.name as cat_name FROM posts p LEFT JOIN categories c ON p.category_id=c.id WHERE p.deleted_at IS NULL ORDER BY p.created_at DESC LIMIT ? OFFSET ?");$stmt->execute([POSTS_PER_PAGE,$offset]);
+  $stmt=$db->prepare("SELECT p.*,c.name as cat_name FROM posts p LEFT JOIN categories c ON p.category_id=c.id WHERE p.deleted_at IS NULL ORDER BY p.pinned DESC,p.created_at DESC LIMIT ? OFFSET ?");$stmt->execute([POSTS_PER_PAGE,$offset]);
   $posts=$stmt->fetchAll(PDO::FETCH_ASSOC);
   $tagsMap=loadPostTags($db,array_column($posts,'id'));
   foreach($posts as&$p){$p['tags']=$tagsMap[$p['id']]??[];$p['is_scheduled']=(!empty($p['publish_at'])&&$p['publish_at']>$now)?1:0;unset($p['password']);}
   json(['posts'=>$posts,'total'=>intval($total),'page'=>$page,'pages'=>ceil($total/POSTS_PER_PAGE)]);
+}
+if($action==='admin_set_pin'&&isAdmin()){
+  csrf_verify();
+  $id=intval($_GET['id']??0);$pin=intval($_GET['pin']??0)?1:0;
+  if($id<=0)json(['error'=>'参数错误'],400);
+  $db->prepare("UPDATE posts SET pinned=? WHERE id=?")->execute([$pin,$id]);
+  addLog($db,$pin?'post_pin':'post_unpin',($pin?'置顶':'取消置顶').'文章 #'.$id);
+  json(['ok'=>true,'pinned'=>!!$pin]);
 }
 if($action==='admin_save'&&isAdmin()){
   csrf_verify();
@@ -805,6 +844,7 @@ if($action==='admin_save'&&isAdmin()){
     }
   }
   addLog($db,'post_save',$id?'编辑文章 #'.$id:'新建文章 #'.$id);
+  regenerateSitemapFile($db);
   json(['ok'=>true,'id'=>$id,'slug'=>$slug]);
 }
 if($action==='admin_delete'&&isAdmin()){
@@ -812,6 +852,7 @@ if($action==='admin_delete'&&isAdmin()){
   $id=intval($_GET['id']??0);
   $db->prepare("UPDATE posts SET deleted_at=? WHERE id=?")->execute([$now,$id]);
   addLog($db,'post_delete','删除文章 #'.$id);
+  regenerateSitemapFile($db);
   json(['ok'=>true]);
 }
 if($action==='admin_trash'&&isAdmin()){
@@ -821,7 +862,7 @@ if($action==='admin_trash'&&isAdmin()){
 }
 if($action==='admin_restore_post'&&isAdmin()){
   csrf_verify();
-  $id=intval($_GET['id']??0);$db->prepare("UPDATE posts SET deleted_at=NULL WHERE id=?")->execute([$id]);addLog($db,'post_restore','恢复文章 #'.$id);json(['ok'=>true]);
+  $id=intval($_GET['id']??0);$db->prepare("UPDATE posts SET deleted_at=NULL WHERE id=?")->execute([$id]);addLog($db,'post_restore','恢复文章 #'.$id);regenerateSitemapFile($db);json(['ok'=>true]);
 }
 if($action==='admin_purge_post'&&isAdmin()){
   csrf_verify();
@@ -829,7 +870,7 @@ if($action==='admin_purge_post'&&isAdmin()){
   $db->prepare("DELETE FROM posts WHERE id=?")->execute([$id]);
   $db->prepare("DELETE FROM post_tags WHERE post_id=?")->execute([$id]);
   $db->prepare("DELETE FROM comments WHERE post_id=?")->execute([$id]);
-  addLog($db,'post_purge','永久删除文章 #'.$id);json(['ok'=>true]);
+  addLog($db,'post_purge','永久删除文章 #'.$id);regenerateSitemapFile($db);json(['ok'=>true]);
 }
 if($action==='admin_batch'&&isAdmin()){
   csrf_verify();
@@ -850,6 +891,7 @@ if($action==='admin_batch'&&isAdmin()){
   }
   else json(['error'=>'不支持的操作'],400);
   addLog($db,'batch_'.$op,'批量操作 '.count($ids).' 篇文章');
+  regenerateSitemapFile($db);
   json(['ok'=>true,'count'=>count($ids)]);
 }
 if($action==='admin_remove_tag_global'&&isAdmin()){
@@ -864,6 +906,7 @@ if($action==='admin_remove_tag_global'&&isAdmin()){
     $db->prepare("DELETE FROM tags WHERE id=?")->execute([$tid]);
   }
   addLog($db,'tag_remove_global','全局移除标签 '.$tag.($removed?'（'.$removed.' 篇文章）':''));
+  regenerateSitemapFile($db);
   json(['ok'=>true,'removed'=>$removed]);
 }
 if($action==='admin_get_post'&&isAdmin()){
@@ -909,11 +952,11 @@ if($action==='admin_cat_save'&&isAdmin()){
     if($db->errorInfo()[2])json(['error'=>'数据库错误: '.$db->errorInfo()[2]],500);
   }else{
     try{$db->prepare("INSERT INTO categories(name,slug,description,parent_id)VALUES(?,?,?,?)")->execute([$name,$slug,$desc,$pid]);}catch(Exception $e){json(['error'=>'保存失败: '.$e->getMessage()],500);}
-  }json(['ok'=>true]);
+  }regenerateSitemapFile($db);json(['ok'=>true]);
 }
 if($action==='admin_cat_delete'&&isAdmin()){
   csrf_verify();
-  $id=intval($_GET['id']??0);$db->prepare("DELETE FROM categories WHERE id=?")->execute([$id]);$db->prepare("UPDATE posts SET category_id=NULL WHERE category_id=?")->execute([$id]);json(['ok'=>true]);
+  $id=intval($_GET['id']??0);$db->prepare("DELETE FROM categories WHERE id=?")->execute([$id]);$db->prepare("UPDATE posts SET category_id=NULL WHERE category_id=?")->execute([$id]);regenerateSitemapFile($db);json(['ok'=>true]);
 }
 if($action==='admin_comments'&&isAdmin()){
   csrf_verify();
@@ -1103,6 +1146,7 @@ if($action==='admin_import_urls'&&isAdmin()){
     $title=str_ireplace(' - '.setting($db,'site_name',SITE_NAME),'',$title);
     $md=htmlToMarkdown(extractMainHtml($html));
     if(mb_strlen($md)<40&&mb_strlen($title)<3){$res['error']='未能提取到正文内容';$results[]=$res;continue;}
+    $md=absolutizeMarkdownImages($md,$url);
     $md=downloadRemoteImages($md,$db);
     $slug=makeUniqueSlug($db,$title);
     $plain=preg_replace('/[#>*`\[\]!|~-]/u',' ',strip_tags($md));
@@ -1115,6 +1159,7 @@ if($action==='admin_import_urls'&&isAdmin()){
     $res['ok']=true;$res['title']=$title;$res['id']=$pid;$res['slug']=$slug;
     $results[]=$res;
   }
+  regenerateSitemapFile($db);
   json(['ok'=>true,'results'=>$results]);
 }
 if($action==='admin_settings'&&isAdmin()){
@@ -1136,7 +1181,7 @@ if($action==='admin_settings'&&isAdmin()){
   }
   $sn=setting($db,'site_name',SITE_NAME);
   $sd=setting($db,'site_desc');
-  $sc=setting($db,'site_copyright','Powered by <strong>MiniBlog</strong> &copy; '.date('Y'));
+  $sc=setting($db,'site_copyright','Powered by <strong><a href="https://github.com/amw1933/miniblog-single" target="_blank" rel="noopener" style="color:var(--b)">MiniBlog</a></strong> &copy; '.date('Y').' · <a href="https://github.com/amw1933/miniblog-single" target="_blank" rel="noopener" style="color:var(--b)">GitHub</a>');
   $ne=setting($db,'notify_email');
   $nw=setting($db,'notify_webhook');
   $ck=setting($db,'comment_keywords');
@@ -1167,16 +1212,32 @@ if($action==='admin_stats'&&isAdmin()){
   foreach($pStmt->fetchAll(PDO::FETCH_ASSOC) as $r)$pmap[$r['d']]=$r['c'];
   $daily=[];
   for($i=13;$i>=0;$i--){$d=date('Y-m-d',strtotime("-$i days"));$daily[]=['date'=>$d,'pv'=>intval($map[$d]['pv']??0),'uv'=>intval($map[$d]['uv']??0),'posts'=>intval($pmap[$d]??0)];}
-  json(['posts'=>$db->query("SELECT COUNT(*) FROM posts WHERE deleted_at IS NULL")->fetchColumn(),'published'=>$db->query("SELECT COUNT(*) FROM posts WHERE published=1 AND deleted_at IS NULL")->fetchColumn(),'comments'=>$db->query("SELECT COUNT(*) FROM comments")->fetchColumn(),'pending'=>$db->query("SELECT COUNT(*) FROM comments WHERE approved=0")->fetchColumn(),'views'=>$db->query("SELECT COALESCE(SUM(views),0) FROM posts WHERE deleted_at IS NULL")->fetchColumn(),'top'=>$top,'daily'=>$daily]);
+  $totalVisitors=(int)$db->query("SELECT COALESCE(SUM(uv),0) FROM stats_daily")->fetchColumn();
+  $tvStmt=$db->prepare("SELECT uv FROM stats_daily WHERE date=?");$tvStmt->execute([date('Y-m-d')]);
+  $todayVisitors=(int)$tvStmt->fetchColumn();
+  $totalIps=(int)$db->query("SELECT COUNT(DISTINCT ip) FROM visit_ips")->fetchColumn();
+  $tiStmt=$db->prepare("SELECT COUNT(*) FROM visit_ips WHERE day=?");$tiStmt->execute([date('Y-m-d')]);
+  $todayIps=(int)$tiStmt->fetchColumn();
+  $recentIps=$db->query("SELECT ip,SUM(visits) visits,MAX(last_at) last_at,MAX(ua) ua FROM visit_ips GROUP BY ip ORDER BY last_at DESC LIMIT 50")->fetchAll(PDO::FETCH_ASSOC);
+  json(['posts'=>$db->query("SELECT COUNT(*) FROM posts WHERE deleted_at IS NULL")->fetchColumn(),'published'=>$db->query("SELECT COUNT(*) FROM posts WHERE published=1 AND deleted_at IS NULL")->fetchColumn(),'comments'=>$db->query("SELECT COUNT(*) FROM comments")->fetchColumn(),'pending'=>$db->query("SELECT COUNT(*) FROM comments WHERE approved=0")->fetchColumn(),'views'=>$db->query("SELECT COALESCE(SUM(views),0) FROM posts WHERE deleted_at IS NULL")->fetchColumn(),'visitors'=>$totalVisitors,'today_visitors'=>$todayVisitors,'total_ips'=>$totalIps,'today_ips'=>$todayIps,'recent_ips'=>$recentIps,'top'=>$top,'daily'=>$daily]);
+}
+function uploadRefNames($db){
+  $refs=[];
+  $rows=$db->query("SELECT content FROM posts")->fetchAll(PDO::FETCH_COLUMN);
+  foreach($rows as $c)if(preg_match_all('/(?<![A-Za-z0-9_\-])uploads\/([^\s"\'<>()]+)/',$c,$mm))$refs=array_merge($refs,$mm[1]);
+  $sv=$db->query("SELECT value FROM settings")->fetchAll(PDO::FETCH_COLUMN);
+  foreach($sv as $v)if($v!==''&&preg_match_all('/(?<![A-Za-z0-9_\-])uploads\/([^\s"\'<>()]+)/',$v,$mm))$refs=array_merge($refs,$mm[1]);
+  $refs=array_flip(array_unique($refs));
+  $refs['avatar.webp']=1;
+  return $refs;
+}
+function lockedFileNames($db){
+  $l=json_decode(setting($db,'locked_files','[]'),true);
+  return is_array($l)?array_values(array_filter(array_map('trim',$l))):[];
 }
 if($action==='admin_cleanup_uploads'&&isAdmin()){
   csrf_verify();
-  $all=[];
-  $rows=$db->query("SELECT id,content FROM posts")->fetchAll(PDO::FETCH_ASSOC);
-  foreach($rows as $r){
-    if(preg_match_all('/(?:^|[.\/])uploads\/([A-Za-z0-9_\-\.]+)/',$r['content'],$mm))$all=array_merge($all,$mm[1]);
-  }
-  $refs=array_flip(array_unique($all));
+  $refs=uploadRefNames($db);foreach(lockedFileNames($db) as $fn)$refs[$fn]=1;
   $deleted=[];$kept=0;$files=@scandir(UPLOAD_DIR);
   if($files===false)$files=[];
   foreach($files as $fn){
@@ -1185,18 +1246,15 @@ if($action==='admin_cleanup_uploads'&&isAdmin()){
     if(isset($refs[$fn]))continue;
     $fp=UPLOAD_DIR.'/'.$fn;
     if(!is_file($fp))continue;
-    if((time()-filemtime($fp))>30*86400){if(@unlink($fp))$deleted[]=$fn;}else{$kept++;}
+    if(@unlink($fp)){$deleted[]=$fn;$db->prepare("DELETE FROM remote_image_cache WHERE local=?")->execute([$fn]);}else{$kept++;}
   }
+  addLog($db,'files_cleanup','一键清理 '.count($deleted).' 个未引用文件');
   json(['ok'=>true,'deleted'=>$deleted,'kept'=>$kept]);
 }
 if($action==='admin_files'&&isAdmin()){
   csrf_verify();
-  $refs=[];$rows=$db->query("SELECT content FROM posts")->fetchAll(PDO::FETCH_COLUMN);
-  foreach($rows as $c)if(preg_match_all('/(?:^|[.\/])uploads\/([A-Za-z0-9_\-\.]+)/',$c,$mm))$refs=array_merge($refs,$mm[1]);
-  $refs=array_flip(array_unique($refs));
-  $curAvatar=trim(setting($db,'author_avatar'));
-  if($curAvatar!==''&&preg_match('#uploads/([A-Za-z0-9_\-\.]+)#',$curAvatar,$am))$refs[basename($am[1])]=1;
-  $refs['avatar.webp']=1;
+  $refs=uploadRefNames($db);
+  $lockedSet=array_flip(lockedFileNames($db));
   $files=[];$total=0;
   $byExt=[];
   $finfo=class_exists('finfo')?new finfo(FILEINFO_MIME_TYPE):null;
@@ -1210,22 +1268,33 @@ if($action==='admin_files'&&isAdmin()){
     $mime=$finfo?($finfo->file($fp)?:''):'';
     $real=($mime===''||$mime==='application/octet-stream')?$e:($typeMap[$mime]??$e);
     $byExt[$real]=($byExt[$real]??0)+$s;
-    $files[]=['name'=>$fn,'size'=>$s,'mtime'=>date('Y-m-d H:i:s',filemtime($fp)),'used'=>isset($refs[$fn]),'ext'=>$e,'type'=>$real,'mime'=>$mime];
+    $files[]=['name'=>$fn,'size'=>$s,'mtime'=>date('Y-m-d H:i:s',filemtime($fp)),'used'=>isset($refs[$fn]),'locked'=>isset($lockedSet[$fn]),'ext'=>$e,'type'=>$real,'mime'=>$mime];
   }
   usort($files,function($a,$b){return strcmp($b['mtime'],$a['mtime']);});
   $maxB=uploadMaxBytes($db);
   json(['files'=>$files,'total'=>$total,'count'=>count($files),'byExt'=>$byExt,'maxBytes'=>$maxB===PHP_INT_MAX?0:$maxB]);
 }
+if($action==='admin_file_lock'&&isAdmin()){
+  csrf_verify();
+  $name=basename($_GET['name']??'');
+  $lock=intval($_GET['lock']??1)?1:0;
+  if($name===''||$name==='.'||$name==='..'||$name==='avatar.webp')json(['error'=>'参数错误'],400);
+  $fp=UPLOAD_DIR.'/'.$name;
+  if(!is_file($fp))json(['error'=>'文件不存在'],404);
+  $list=lockedFileNames($db);
+  $key=array_search($name,$list,true);
+  if($lock){if($key===false)$list[]=$name;}
+  elseif($key!==false)array_splice($list,$key,1);
+  $db->prepare("INSERT OR REPLACE INTO settings(key,value)VALUES('locked_files',?)")->execute([json_encode(array_values($list),JSON_UNESCAPED_UNICODE)]);
+  addLog($db,$lock?'file_lock':'file_unlock',($lock?'锁定':'解锁').'文件 '.$name);
+  json(['ok'=>true,'locked'=>!!$lock]);
+}
 if($action==='admin_file_delete'&&isAdmin()){
   csrf_verify();
   $name=basename($_GET['name']??'');
   if($name===''||$name==='.'||$name==='..')json(['error'=>'参数错误'],400);
-  $refs=[];$rows=$db->query("SELECT content FROM posts")->fetchAll(PDO::FETCH_COLUMN);
-  foreach($rows as $c)if(preg_match_all('/(?:^|[.\/])uploads\/([A-Za-z0-9_\-\.]+)/',$c,$mm))$refs=array_merge($refs,$mm[1]);
-  if(in_array($name,$refs,true))json(['error'=>'该文件被文章引用，不允许删除'],403);
-  $curAvatar=trim(setting($db,'author_avatar'));
-  if($curAvatar!==''&&preg_match('#uploads/([A-Za-z0-9_\-\.]+)#',$curAvatar,$am)&&$name===basename($am[1]))json(['error'=>'该文件是站点头像，不允许删除'],403);
-  if($name==='avatar.webp')json(['error'=>'该文件是站点头像，不允许删除'],403);
+  $refs=uploadRefNames($db);foreach(lockedFileNames($db) as $fn)$refs[$fn]=1;
+  if(isset($refs[$name]))json(['error'=>'该文件被引用或已锁定，不允许删除'],403);
   $fp=UPLOAD_DIR.'/'.$name;
   if(!is_file($fp))json(['error'=>'文件不存在'],404);
   if(!@unlink($fp))json(['error'=>'删除失败'],500);
@@ -1238,12 +1307,7 @@ if($action==='admin_files_batch_delete'&&isAdmin()){
   $d=json_decode(file_get_contents('php://input'),true);
   $names=array_values(array_unique(array_filter(array_map(function($n){return basename((string)$n);},$d['files']??[]))));
   if(!$names)json(['error'=>'请选择要删除的文件'],400);
-  $refs=[];$rows=$db->query("SELECT content FROM posts")->fetchAll(PDO::FETCH_COLUMN);
-  foreach($rows as $c)if(preg_match_all('/(?:^|[.\/])uploads\/([A-Za-z0-9_\-\.]+)/',$c,$mm))$refs=array_merge($refs,$mm[1]);
-  $refs=array_flip(array_unique($refs));
-  $curAvatar=trim(setting($db,'author_avatar'));
-  if($curAvatar!==''&&preg_match('#uploads/([A-Za-z0-9_\-\.]+)#',$curAvatar,$am))$refs[basename($am[1])]=1;
-  $refs['avatar.webp']=1;
+  $refs=uploadRefNames($db);foreach(lockedFileNames($db) as $fn)$refs[$fn]=1;
   $deleted=[];$skipped=[];
   foreach($names as $n){
     if(isset($refs[$n])){$skipped[]=$n;continue;}
@@ -1459,6 +1523,11 @@ function md($t){
     $t=str_replace("␌VIDEO{$i}␌",$html,$t);
   }
   return $t;
+}
+function mdWithAlt($t,$title){
+  $html=md($t);
+  $alt=htmlspecialchars(strip_tags($title),ENT_QUOTES);
+  return preg_replace('/<img([^>]*)\balt="[^"]*"/i','<img$1 alt="'.$alt.'"',$html);
 }
 
 /**
@@ -1754,6 +1823,16 @@ function htmlTableToMarkdown($html){
     return "\n\n".implode("\n",$lines)."\n\n";
   },$html);
 }
+function absolutizeMarkdownImages($md,$pageUrl){
+  $p=parse_url($pageUrl);$scheme=$p['scheme']??'http';$host=$p['host']??'';$baseDir=dirname($pageUrl);
+  return preg_replace_callback('/!\[[^\]]*\]\(([^)]+)\)/',function($m)use($scheme,$host,$baseDir){
+    $u=trim($m[1]);
+    if(preg_match('#^(https?:|data:|#)#i',$u))return $m[0];
+    if(strpos($u,'//')===0)return str_replace($u,$scheme.':'.$u,$m[0]);
+    if(strpos($u,'/')===0)return str_replace($u,$scheme.'://'.$host.$u,$m[0]);
+    return str_replace($u,rtrim($baseDir,'/').'/'.ltrim($u,'./'),$m[0]);
+  },$md);
+}
 function makeUniqueSlug($db,$title){
   $slug=preg_replace('/[^a-z0-9]+/','-',mb_strtolower(trim($title),'UTF-8'));$slug=trim($slug,'-');
   if($slug==='')$slug='post';
@@ -1810,7 +1889,7 @@ if($slug&&!$isAdminPage){
     $db->prepare("UPDATE posts SET views=views+1 WHERE id=?")->execute([$singlePost['id']]);
     trackVisit($db);
     $cs=$db->prepare("SELECT * FROM comments WHERE post_id=? AND approved=1 ORDER BY created_at ASC");$cs->execute([$singlePost['id']]);
-    $singlePost['comments']=$cs->fetchAll(PDO::FETCH_ASSOC);$singlePost['content_html']=md($singlePost['content']);
+    $singlePost['comments']=$cs->fetchAll(PDO::FETCH_ASSOC);$singlePost['content_html']=mdWithAlt($singlePost['content'],$singlePost['title']);
     $tagsMap=loadPostTags($db,[$singlePost['id']]);$singlePost['tags']=$tagsMap[$singlePost['id']]??[];
     $singlePost['cats']=array_map(function($x){return $x['name'];},loadPostCats($db,$singlePost['id']));
     $rel=$db->prepare("SELECT DISTINCT p.id,p.slug,p.title,p.excerpt,p.created_at,p.views FROM posts p JOIN post_tags pt ON pt.post_id=p.id WHERE p.id<>? AND p.published=1 AND p.deleted_at IS NULL AND (p.password IS NULL OR p.password='') AND (p.publish_at IS NULL OR p.publish_at<=?) AND pt.tag_id IN (SELECT tag_id FROM post_tags WHERE post_id=?) ORDER BY p.views DESC LIMIT 5");
@@ -2044,7 +2123,7 @@ var excerptHtml=p.locked?'<div class="lock-tip"><?=ico('lock',13)?> 私密文章
         '<a href="?slug='+encodeURIComponent(p.slug)+'" class="post-thumb">'+thumbHtml+'<time>'+dateStr+'</time></a>'+
         '<div class="post-body">'+
         (p.cat_name?'<span class="cat">'+escapeHtml(p.cat_name)+'</span>':'')+
-'<h2><a href="?slug='+encodeURIComponent(p.slug)+'">'+hl(p.title)+(p.locked?' <?=ico('lock',12)?>':'')+'</a></h2>'+
+        '<h2>'+(p.pinned?'<span style="background:#f59e0b;color:#fff;font-size:.68rem;padding:2px 8px;border-radius:20px;margin-right:6px;vertical-align:2px">置顶</span>':'')+'<a href="?slug='+encodeURIComponent(p.slug)+'">'+hl(p.title)+(p.locked?' <?=ico('lock',12)?>':'')+'</a></h2>'+
         excerptHtml+
         '<div class="meta">'+
 '<span><?=ico('calendar',12)?> '+dateStr+'</span>'+
@@ -2131,7 +2210,7 @@ function includePost($post,$cats,$db){?>
     <div class="post-tags"><?php foreach($post['tags'] as $tg):?><a class="tag-chip" href="?tag=<?=urlencode($tg['slug'])?>">#<?=htmlspecialchars($tg['name'])?></a><?php endforeach;?></div>
     <?php endif;?>
     <div id="tocBox" class="toc-box"></div>
-    <div class="content"><?=$post['content_html']??md($post['content'])?></div>
+    <div class="content"><?=$post['content_html']??mdWithAlt($post['content'],$post['title'])?></div>
     <?php if(isAdmin()):?>
     <div style="text-align:center;margin-top:22px"><button onclick="openEditor(<?= (int)$post['id'] ?>)" class="btn btn-primary" style="padding:8px 24px;font-size:.85rem;"><?=ico('edit',13)?> 编辑此文章</button></div>
     <?php endif;?>
@@ -2233,6 +2312,7 @@ try{
 }catch(e){}
 </script>
 <title><?=htmlspecialchars($singlePost?$singlePost['title'].' - ':'')?><?=htmlspecialchars($sn)?></title>
+<?php if($isAdminPage):?><meta name="robots" content="noindex,nofollow"><?php endif;?>
 <meta name="description" content="<?=htmlspecialchars($singlePost?strip_tags(mb_substr($singlePost['content'],0,150)):$sd)?>">
 <?php $canonical=$singlePost?SITE_URL.'/?slug='.urlencode($singlePost['slug']):SITE_URL.'/';?>
 <link rel="canonical" href="<?=htmlspecialchars($canonical)?>">
@@ -2278,7 +2358,7 @@ footer{margin-top:auto;text-align:center;padding:32px 20px;color:var(--t3);font-
 .post-card h2 a:hover{color:var(--b)}
 .post-card .meta{font-size:.78rem;color:var(--t3);margin-bottom:12px;display:flex;gap:16px;align-items:center}
 .post-card .meta span{display:flex;align-items:center;gap:4px}
-.post-card .excerpt{font-size:.88rem;color:var(--t2);line-height:1.7;margin-bottom:14px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.post-card .excerpt{font-size:.88rem;color:var(--t2);line-height:1.7;margin-bottom:14px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .post-card .read-more{color:var(--b);font-weight:600;font-size:.82rem;display:inline-flex;align-items:center;gap:4px;transition:gap .2s}
 .post-card .read-more:hover{gap:8px}
 .single-post{background:var(--card);border-radius:var(--radius-lg);padding:36px;box-shadow:var(--s);margin:28px 0;border:1px solid rgba(0,0,0,.04);position:relative;overflow:hidden}
@@ -2372,6 +2452,8 @@ footer{margin-top:auto;text-align:center;padding:32px 20px;color:var(--t3);font-
 .admin-table td .actions button:hover{transform:translateY(-1px)}
 .admin-table tr:last-child td{border-bottom:none}
 .admin-table tr:hover td{background:#fafbff}.status-badge{display:inline-block;padding:3px 10px;border-radius:40px;font-size:.7rem;font-weight:600;white-space:nowrap}
+.file-link{color:var(--b);text-decoration:none;cursor:pointer;border-bottom:1px dashed rgba(99,102,241,.4);transition:all .15s}
+.file-link:hover{color:var(--b);text-decoration:underline;border-bottom-style:solid}
 .status-badge.published{background:#dcfce7;color:#166534}.status-badge.draft{background:#fef3c7;color:#92400e}
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);z-index:1000;display:none;align-items:center;justify-content:center;padding:20px}
 .modal.show{display:flex}.modal-content{background:var(--card);border-radius:var(--radius-lg);padding:32px;width:100%;max-width:880px;max-height:90vh;overflow-y:auto;box-shadow:0 25px 50px rgba(0,0,0,.2)}
@@ -2725,7 +2807,7 @@ header nav .nav-btn.active{background:linear-gradient(135deg,var(--bh),var(--g2)
 .post-card:hover{transform:translateY(-3px);box-shadow:0 10px 30px rgba(0,0,0,.1)}
 .post-card:hover{border-color:rgba(251,108,40,.18)}
 .post-card::before{background:linear-gradient(90deg,var(--g1),var(--g2))}
-.post-thumb{flex:0 0 220px;width:220px;min-height:0;aspect-ratio:16/10;height:auto;align-self:flex-start;border-radius:10px;background:linear-gradient(135deg,var(--g1),var(--g2));overflow:hidden;position:relative;display:block;text-decoration:none}
+.post-thumb{flex:0 0 220px;width:220px;min-height:0;aspect-ratio:16/10;height:auto;align-self:center;border-radius:10px;background:linear-gradient(135deg,var(--g1),var(--g2));overflow:hidden;position:relative;display:block;text-decoration:none}
 .post-thumb img{width:100%;height:100%;object-fit:cover;display:block;position:absolute;top:0;left:0}
 .post-thumb svg{width:100%;height:100%;display:block;position:absolute;top:0;left:0}
 .post-thumb time{position:absolute;left:10px;bottom:10px;font-size:.7rem;color:#fff;background:rgba(0,0,0,.55);border-radius:6px;padding:2px 8px;z-index:2}
@@ -2970,7 +3052,7 @@ header nav .nav-btn.active{background:linear-gradient(135deg,var(--bh),var(--g2)
       <a href="?admin=files" class="btn tab-btn <?=$page==='files'?'active':''?>"><?=ico('folder',15)?> 文件</a>
 <a href="?admin=settings" class="btn tab-btn <?=$page==='settings'?'active':''?>"><?=gearIcon(15,'currentColor')?> 系统设置</a>
       <a href="?action=logout" class="btn btn-danger" onclick="return confirm('确定退出？')"><?=ico('logout',15)?> 退出</a>
-      <button onclick="cleanupUploads()" class="btn btn-secondary"><?=ico('filter',15)?> 清理上传</button>
+      <button onclick="cleanupUploads()" class="btn btn-secondary"><?=ico('trash',15)?> 清理全部未引用</button>
     </div>
   </div>
   <div id="adminApp"><div class="loading"><span class="spinner"></span>加载中...</div></div>
@@ -3007,8 +3089,17 @@ header nav .nav-btn.active{background:linear-gradient(135deg,var(--bh),var(--g2)
 </main>
 <footer><div class="container">
   <?php
+  $totalVisitors=(int)$db->query("SELECT COALESCE(SUM(uv),0) FROM stats_daily")->fetchColumn();
+  $tvStmt=$db->prepare("SELECT uv FROM stats_daily WHERE date=?");$tvStmt->execute([date('Y-m-d')]);
+  $todayVisitors=(int)$tvStmt->fetchColumn();
+  ?>
+  <div style="margin-bottom:8px;display:flex;gap:14px;justify-content:center;flex-wrap:wrap">
+    <span><?=ico('user',14)?>访问人数 <?=number_format($totalVisitors)?></span>
+    <span><?=ico('clock',14)?>今日 <?=number_format($todayVisitors)?></span>
+  </div>
+  <?php
   $scFooter=setting($db,'site_copyright');
-  echo $scFooter ?: 'Powered by <strong>MiniBlog</strong> &copy; '.date('Y');
+  echo $scFooter ?: 'Powered by <strong><a href="https://github.com/amw1933/miniblog-single" target="_blank" rel="noopener" style="color:var(--b)">MiniBlog</a></strong> &copy; '.date('Y').' · <a href="https://github.com/amw1933/miniblog-single" target="_blank" rel="noopener" style="color:var(--b)">GitHub</a>';
   ?>
 </div></footer>
 <script>
@@ -3111,6 +3202,8 @@ function loadDashboard(){
       '<div class="stat-card"><b>'+d.comments+'</b><span>评论</span></div>'+
       '<div class="stat-card"><b>'+d.pending+'</b><span>待审核</span></div>'+
       '<div class="stat-card"><b>'+d.views+'</b><span>总浏览</span></div>'+
+      '<div class="stat-card"><b>'+d.visitors+'</b><span>访问人数</span></div>'+
+      '<div class="stat-card"><b>'+d.today_visitors+'</b><span>今日访问</span></div>'+
     '</div>';
     h+='<div style="background:var(--card);border-radius:var(--br);padding:20px;box-shadow:var(--s);margin-top:16px"><h3 style="font-size:1rem;margin-bottom:12px">近14天访问趋势</h3>';
     (d.daily||[]).forEach(function(r){var max=Math.max(1,r.pv,r.uv);h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:.78rem"><span style="width:78px;flex:none;color:var(--t3)">'+r.date.slice(5)+'</span><div style="flex:1;height:14px;background:#eef2ff;border-radius:7px;overflow:hidden"><div style="width:'+Math.round(r.pv/max*100)+'%;height:100%;background:var(--b);border-radius:7px"></div></div><span style="width:62px;flex:none">PV '+r.pv+'</span><span style="width:62px;flex:none">UV '+r.uv+'</span></div>';});
@@ -3118,6 +3211,13 @@ function loadDashboard(){
     h+='<div style="background:var(--card);border-radius:var(--br);padding:20px;box-shadow:var(--s);margin-top:16px"><h3 style="font-size:1rem;margin-bottom:12px">热门文章 Top 10</h3>';
     (d.top||[]).forEach(function(p,i){h+='<div style="display:flex;justify-content:space-between;gap:10px;padding:7px 0;border-bottom:1px solid rgba(0,0,0,.04);font-size:.85rem"><a href="?slug='+encodeURIComponent(p.slug)+'" target="_blank" style="color:var(--t1);text-decoration:none;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(i+1)+'. '+escapeHtml(p.title)+'</a><span style="color:var(--t3);flex:none">'+p.views+' 次</span></div>';});
     h+='</div>';
+    h+='<div style="background:var(--card);border-radius:var(--br);padding:20px;box-shadow:var(--s);margin-top:16px"><h3 style="font-size:1rem;margin-bottom:12px">最近访问 IP（近90天）</h3>';
+    h+='<table class="admin-table"><thead><tr><th>IP</th><th>访问次数</th><th>最后访问</th><th>UA</th></tr></thead><tbody>';
+    (d.recent_ips||[]).forEach(function(r){
+      h+='<tr><td style="font-family:monospace;font-size:.8rem">'+escapeHtml(r.ip)+'</td><td>'+r.visits+'</td><td style="font-size:.82rem">'+escapeHtml(r.last_at)+'</td><td style="font-size:.75rem;color:var(--t3);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+escapeHtml(r.ua||'')+'">'+escapeHtml(r.ua||'-')+'</td></tr>';
+    });
+    if(!(d.recent_ips||[]).length)h+='<tr><td colspan="4" style="text-align:center;color:var(--t3);padding:20px">暂无访问记录</td></tr>';
+    h+='</tbody></table></div>';
     app.innerHTML=h;
   }).catch(function(){if(app)app.innerHTML='<div class="empty">加载失败</div>';});
 }
@@ -3133,12 +3233,14 @@ app.innerHTML='<div class="empty"><div class="empty-icon"><?=ico('file-text',30)
     html+='<div class="batch-bar"><input type="checkbox" id="selAll" onchange="toggleAll(this)"><span>全选</span><button onclick="batchOp(\'publish\')">批量发布</button><button onclick="batchOp(\'draft\')">转草稿</button><button onclick="batchOp(\'delete\')">批量删除</button><button onclick="batchOp(\'category\')">改分类</button><button onclick="batchOp(\'tag\')">加标签</button><button onclick="batchOp(\'remove_tag\')">去标签</button></div>';
     html+='<table class="admin-table"><thead><tr><th style="width:36px"><input type="checkbox" id="selAll2" onchange="toggleAll(this)"></th><th>标题</th><th>分类</th><th>状态</th><th>日期</th><th>操作</th></tr></thead><tbody>';
     d.posts.forEach(function(p){
-      var titleLink = '<a href="?slug=' + encodeURIComponent(p.slug) + '" target="_blank" style="color:var(--b); font-weight:600;">' + escapeHtml(p.title) + '</a>';
+      var titleLink = (p.pinned?'<span style="background:#f59e0b;color:#fff;font-size:.68rem;padding:2px 8px;border-radius:20px;margin-right:6px">置顶</span>':'') + '<a href="?slug=' + encodeURIComponent(p.slug) + '" target="_blank" style="color:var(--b); font-weight:600;">' + escapeHtml(p.title) + '</a>';
       var tagHtml=((p.tags||[]).map(function(t){return '<a class="tag-chip" href="?tag='+encodeURIComponent(t.slug)+'">'+escapeHtml(t.name)+'</a>'})).join('');
       var statusHtml=p.is_scheduled?'<span class="status-badge draft">定时</span>':'<span class="status-badge '+(p.published?'published':'draft')+'">'+(p.published?'已发布':'草稿')+'</span>';
       html+='<tr><td><input type="checkbox" class="rowSel" value="'+p.id+'"></td><td style="font-weight:600">' + titleLink + (tagHtml?'<div class="card-tags" style="margin-top:4px">'+tagHtml+'</div>':'') + '</td><td style="color:var(--t2)">'+escapeHtml(p.cat_name||'未分类')+'</td><td>'+statusHtml+'</td><td style="font-size:.82rem;color:var(--t2)">'+p.created_at.split(' ')[0]+'</td><td><div class="actions">'+
         '<button onclick="window.open(\'?slug='+encodeURIComponent(p.slug)+'\')" style="background:#eef2ff;color:var(--b)">查看</button>'+
-        '<button onclick="openEditor('+p.id+')" style="background:#eef2ff;color:var(--b)">编辑</button><button onclick="deletePost('+p.id+')" style="background:#fef2f2;color:#ef4444">删除</button></div></td></tr>';
+        '<button onclick="openEditor('+p.id+')" style="background:#eef2ff;color:var(--b)">编辑</button>'+
+        (p.pinned?'<button onclick="setPostPin('+p.id+',0)" style="background:#fef3c7;color:#b45309">取消置顶</button>':'<button onclick="setPostPin('+p.id+',1)" style="background:#fefce8;color:#a16207">置顶</button>')+
+        '<button onclick="deletePost('+p.id+')" style="background:#fef2f2;color:#ef4444">删除</button></div></td></tr>';
     });
     html+='</tbody></table>';
     if(d.pages>1){
@@ -3148,6 +3250,9 @@ app.innerHTML='<div class="empty"><div class="empty-icon"><?=ico('file-text',30)
     }
     app.innerHTML=html;
   }).catch(function(){if(app)app.innerHTML='<div class="empty">加载失败</div>';});
+}
+function setPostPin(id,pin){
+  apiFetch('?action=admin_set_pin&id='+id+'&pin='+(pin?1:0)).then(function(r){return r.json()}).then(function(d){if(d.ok)loadPostsList();else alert(d.error||'操作失败')}).catch(function(){alert('请求失败，请重试')});
 }
 function selectedIds(){var ids=[];document.querySelectorAll('.rowSel:checked').forEach(function(c){ids.push(parseInt(c.value,10));});return ids;}
 function toggleAll(cb){document.querySelectorAll('.rowSel').forEach(function(c){c.checked=cb.checked;});}
@@ -3649,9 +3754,9 @@ function blacklistRemove(ip){apiFetch('?action=admin_blacklist_remove&ip='+encod
 function approveComment(id){apiFetch('?action=admin_comment_approve&id='+id).then(function(r){return r.json()}).then(function(d){if(d.ok)loadCommentsList()});}
 function deleteComment(id){if(!confirm('确定删除此评论？'))return;apiFetch('?action=admin_comment_delete&id='+id).then(function(r){return r.json()}).then(function(d){if(d.ok)loadCommentsList()});}
 function cleanupUploads(){
-  if(!confirm('确定清理未被文章引用的旧上传文件（保留30天内的）？'))return;
+  if(!confirm('确定一键清理全部未被引用的文件吗？文章、头像和系统设置引用的文件会保留，此操作不可恢复！'))return;
   apiFetch('?action=admin_cleanup_uploads').then(function(r){return r.json()}).then(function(d){
-    if(d.ok){alert('已清理 '+d.deleted.length+' 个文件'+(d.kept?'，保留 '+d.kept+' 个近期文件':''));if(loadSettings)loadSettings();}
+    if(d.ok){alert('已清理 '+d.deleted.length+' 个未引用文件'+(d.kept?'，跳过 '+d.kept+' 个文件':''));if(location.search.indexOf('admin=files')>=0)loadFiles();else if(loadSettings)loadSettings();}
     else alert(d.error||'清理失败');
   }).catch(function(){alert('清理请求失败，请重试')});
 }
@@ -3664,18 +3769,22 @@ if(!d.files||!d.files.length){app.innerHTML='<div class="empty"><div class="empt
     var allFiles=d.files||[];
     var filt=window._fileTypeFilter||'';
     var shown=filt?allFiles.filter(function(f){return (f.type||f.ext||'none')===filt;}):allFiles;
-    var unused=allFiles.filter(function(f){return !f.used;}).length;
+    var unused=allFiles.filter(function(f){return !f.used&&!f.locked;}).length;
     var capInfo=d.maxBytes>0?(' · 单文件上限 '+mb(d.maxBytes)):' · 单文件大小不限';
     var countTxt=filt?('显示 '+shown.length+' / '+d.count+' 个文件'):('共 '+d.count+' 个文件');
-    var html='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:8px"><span class="file-summary">'+countTxt+'，占用 '+mb(d.total)+capInfo+'，未引用 '+unused+' 个</span><span><button onclick="batchDeleteFiles()" class="btn btn-danger" style="padding:7px 14px;border-radius:40px;border:none;color:#fff;background:#ef4444;font-size:.78rem;cursor:pointer"><?=ico('trash',12)?> 批量删除</button></span></div>';
+    var html='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:8px"><span class="file-summary">'+countTxt+'，占用 '+mb(d.total)+capInfo+'，未引用 '+unused+' 个</span><span><button onclick="cleanupUploads()" class="btn btn-danger" style="padding:7px 14px;border-radius:40px;border:none;color:#fff;background:#f59e0b;font-size:.78rem;cursor:pointer"><?=ico('filter',12)?> 一键清理全部未引用</button><button onclick="batchDeleteFiles()" class="btn btn-danger" style="padding:7px 14px;border-radius:40px;border:none;color:#fff;background:#ef4444;font-size:.78rem;cursor:pointer;margin-left:8px"><?=ico('trash',12)?> 批量删除</button></span></div>';
     var extHtml='<span class="tag-chip'+(filt?'':' active')+'" style="cursor:pointer" onclick="filterFilesByType(\'\')">全部</span>';
     if(d.byExt){for(var k in d.byExt){extHtml+='<span class="tag-chip'+(filt===k?' active':'')+'" style="cursor:pointer" onclick="filterFilesByType(\''+k+'\')">'+escapeHtml(k)+' '+mb(d.byExt[k])+'</span>';}}
     html+='<div class="card-tags" style="margin:8px 0">'+extHtml+'</div>';
     html+='<table class="admin-table"><thead><tr><th style="width:40px"><input type="checkbox" onchange="toggleAllFiles(this)"></th><th>文件名</th><th>类型</th><th>大小</th><th>修改时间</th><th>引用</th><th>操作</th></tr></thead><tbody>';
     shown.forEach(function(f){
-      var chk=f.used?'':('<input type="checkbox" class="fileSel" value="'+escapeHtml(f.name)+'">');
-      var op=f.used?'<span style="color:var(--t3);font-size:.75rem">不可删除</span>':'<button onclick="deleteUploadFile(\''+escapeHtml(f.name)+'\')" style="background:#fef2f2;color:#ef4444;border:none;border-radius:8px;padding:5px 12px;cursor:pointer">删除</button>';
-      html+='<tr><td style="text-align:center">'+chk+'</td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:.8rem">'+escapeHtml(f.name)+'</td><td style="font-size:.8rem" title="'+(f.mime?escapeHtml(f.mime):'')+'">'+escapeHtml(f.type||f.ext||'none')+'</td><td style="font-size:.82rem">'+mb(f.size)+'</td><td style="font-size:.82rem">'+f.mtime+'</td><td>'+(f.used?'<span class="status-badge published">引用中</span>':'<span class="status-badge draft">未引用</span>')+'</td><td>'+op+'</td></tr>';
+      var chk=(f.used||f.locked)?'':('<input type="checkbox" class="fileSel" value="'+escapeHtml(f.name)+'">');
+      var op;
+      if(f.used)op='<span style="color:var(--t3);font-size:.75rem">不可删除</span>';
+      else if(f.locked)op='<button onclick="lockUploadFile(\''+escapeHtml(f.name)+'\',0)" style="background:#eef2ff;color:var(--b);border:none;border-radius:8px;padding:5px 12px;cursor:pointer">解锁</button>';
+      else op='<button onclick="lockUploadFile(\''+escapeHtml(f.name)+'\',1)" style="background:#fefce8;color:#a16207;border:none;border-radius:8px;padding:5px 12px;cursor:pointer">锁定</button> <button onclick="deleteUploadFile(\''+escapeHtml(f.name)+'\')" style="background:#fef2f2;color:#ef4444;border:none;border-radius:8px;padding:5px 12px;cursor:pointer">删除</button>';
+      var badge=f.used?'<span class="status-badge published">引用中</span>':(f.locked?'<span class="status-badge" style="background:#fef3c7;color:#b45309">已锁定</span>':'<span class="status-badge draft">未引用</span>');
+      html+='<tr><td style="text-align:center">'+chk+'</td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:monospace;font-size:.8rem"><a class="file-link" href="./uploads/'+encodeURIComponent(f.name)+'" target="_blank" rel="noopener" title="点击打开：'+escapeHtml(f.name)+'" style="display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom">'+escapeHtml(f.name)+'</a></td><td style="font-size:.8rem" title="'+(f.mime?escapeHtml(f.mime):'')+'">'+escapeHtml(f.type||f.ext||'none')+'</td><td style="font-size:.82rem">'+mb(f.size)+'</td><td style="font-size:.82rem">'+f.mtime+'</td><td>'+badge+'</td><td>'+op+'</td></tr>';
     });
     if(!shown.length){html+='<tr><td colspan="7" style="text-align:center;color:var(--t3);padding:24px;font-size:.85rem">该类型暂无文件</td></tr>';}
     html+='</tbody></table>';
@@ -3686,6 +3795,9 @@ function filterFilesByType(t){window._fileTypeFilter=t;loadFiles();}
 function deleteUploadFile(name){
   if(!confirm('确定删除文件 '+name+' 吗？'))return;
   apiFetch('?action=admin_file_delete&name='+encodeURIComponent(name)).then(function(r){return r.json()}).then(function(d){if(d.ok)loadFiles();else alert(d.error||'删除失败')}).catch(function(){alert('删除失败，请重试')});
+}
+function lockUploadFile(name,lock){
+  apiFetch('?action=admin_file_lock&name='+encodeURIComponent(name)+'&lock='+(lock?1:0)).then(function(r){return r.json()}).then(function(d){if(d.ok)loadFiles();else alert(d.error||'操作失败')}).catch(function(){alert('请求失败，请重试')});
 }
 function toggleAllFiles(cb){document.querySelectorAll('.fileSel').forEach(function(c){c.checked=cb.checked;});}
 function batchDeleteFiles(){
