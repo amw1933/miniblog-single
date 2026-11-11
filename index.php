@@ -1630,19 +1630,28 @@ function getPostThumbnail($content,$title){
   if($palOrder===null){$palOrder=array_keys($palettes);shuffle($palOrder);}
   $pal=$palettes[$palOrder[$palPos%count($palOrder)]];$palPos++;
   $gid='g'.bin2hex(random_bytes(5));
-  $siteName=setting($db,'site_name',SITE_NAME);
-  $siteName=htmlspecialchars($siteName,ENT_QUOTES|ENT_XML1,'UTF-8');
+  // ★ 改进：缩略图显示【文章标题】+【正文里引用的 GitHub 地址】；配色仍每次请求随机
+  $label=trim(preg_replace('/\s+/u',' ',strip_tags($title)));
+  if($label===''){$label='未命名';}
+  if(mb_strlen($label,'UTF-8')>24){$label=mb_substr($label,0,24,'UTF-8').'…';}
+  $ghRepo='';
+  if(preg_match('~https?://github\.com/([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)~',$content,$gm)){
+    $ghRepo=preg_replace('~\.git$~','',$gm[1]);
+  }
+  $esc=function($s){return htmlspecialchars($s,ENT_QUOTES|ENT_XML1,'UTF-8');};
   $svgFont=str_replace("'",'&apos;',siteFontCss($db));
   $nameLen=0;$charCount=0;
-  for($i=0;$i<mb_strlen($siteName,'UTF-8');$i++){
-    $ch=mb_substr($siteName,$i,1,'UTF-8');
+  for($i=0;$i<mb_strlen($label,'UTF-8');$i++){
+    $ch=mb_substr($label,$i,1,'UTF-8');
     $charCount++;
     $nameLen+=preg_match('/[\x{4e00}-\x{9fff}]/u',$ch)?1.05:0.68;
   }
-  $fontSize=floor(330/max(1,($nameLen+$charCount*0.02)));
-  $fontSize=min(46,max(12,$fontSize));
-  $letterSpacing=($fontSize<34)?0:max(0,round($fontSize*0.06));
-  $fitAttr=($fontSize<30)?' textLength="330" lengthAdjust="spacingAndGlyphs"':'';
+  $fontSize=floor(340/max(1,($nameLen+$charCount*0.02)));
+  $fontSize=min(30,max(11,$fontSize));
+  $letterSpacing=($fontSize<22)?0:max(0,round($fontSize*0.05));
+  $fitAttr=($fontSize<24)?' textLength="340" lengthAdjust="spacingAndGlyphs"':'';
+  $ghSize=($ghRepo!=='')?max(9,min(12,(int)round($fontSize*0.40))):0;
+  $titleY=($ghRepo!=='')?150:160;
   $cx1=80+($hash%200);$cy1=60+($hash%120);$r1=40+($hash%60);
   $cx2=220+($hash%150);$cy2=80+($hash%100);$r2=30+($hash%50);
   $cx3=($hash%300);$cy3=140+($hash%60);$r3=20+($hash%40);
@@ -1656,8 +1665,8 @@ function getPostThumbnail($content,$title){
     <circle cx="'.$cx2.'" cy="'.$cy2.'" r="'.$r2.'" fill="rgba(255,255,255,0.08)"/>
     <circle cx="'.$cx3.'" cy="'.$cy3.'" r="'.$r3.'" fill="rgba(255,255,255,0.06)"/>
 <circle cx="'.(($hash*7)%350+10).'" cy="'.(($hash*13)%200+20).'" r="'.(($hash*17)%40+15).'" fill="rgba(255,255,255,0.04)"/>
-<text x="200" y="172" text-anchor="middle" font-family="'.$svgFont.'" font-size="'.$fontSize.'" font-style="italic" font-weight="600" letter-spacing="'.$letterSpacing.'"'.$fitAttr.' fill="rgba(0,0,0,0.28)">'.$siteName.'</text>
-<text x="200" y="168" text-anchor="middle" font-family="'.$svgFont.'" font-size="'.$fontSize.'" font-style="italic" font-weight="600" letter-spacing="'.$letterSpacing.'"'.$fitAttr.' fill="rgba(255,255,255,0.96)">'.$siteName.'</text>
+<text x="200" y="'.($titleY+4).'" text-anchor="middle" font-family="'.$svgFont.'" font-size="'.$fontSize.'" font-weight="700" letter-spacing="'.$letterSpacing.'"'.$fitAttr.' fill="rgba(0,0,0,0.30)">'.$esc($label).'</text>
+<text x="200" y="'.$titleY.'" text-anchor="middle" font-family="'.$svgFont.'" font-size="'.$fontSize.'" font-weight="700" letter-spacing="'.$letterSpacing.'"'.$fitAttr.' fill="rgba(255,255,255,0.97)">'.$esc($label).'</text>'.($ghRepo!==''?'<text x="200" y="'.($titleY+30).'" text-anchor="middle" font-family="'.$svgFont.'" font-size="'.$ghSize.'" font-weight="600" fill="rgba(255,255,255,0.86)">'.$esc('github.com/'.$ghRepo).'</text>':'').'
 </svg>';
   return $svg;
 }
